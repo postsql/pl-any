@@ -1,0 +1,405 @@
+-- complain if script is sourced in psql, rather than via CREATE EXTENSION
+\echo Use "CREATE EXTENSION pl_jsonschema" to load this file. \quit
+
+DO $pljsonschema_install$
+DECLARE
+  v_lang text;
+BEGIN
+  IF (
+    SELECT pg_catalog.count(*)
+      FROM pg_catalog.pg_extension
+     WHERE extname IN ('pl_jsonschema', 'pl-jsonschema')
+  ) > 1 THEN
+    RAISE EXCEPTION 'pl/jsonschema extension is already installed';
+  END IF;
+
+  v_lang := NULLIF(pg_catalog.current_setting('pl_jsonschema.engine', true), '');
+
+  IF v_lang IS NOT NULL THEN
+    IF v_lang NOT IN ('plv8', 'pljs') THEN
+      RAISE EXCEPTION 'pl/jsonschema: unsupported engine "%" (expected "plv8" or "pljs")', v_lang;
+    END IF;
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_catalog.pg_language WHERE lanname = v_lang
+    ) THEN
+      RAISE EXCEPTION 'pl/jsonschema: requested language "%" is not installed in this database', v_lang
+        USING HINT = pg_catalog.format('Run CREATE EXTENSION %I; before CREATE EXTENSION pl_jsonschema;.', v_lang);
+    END IF;
+  ELSE
+    SELECT lanname INTO v_lang
+      FROM pg_catalog.pg_language
+     WHERE lanname IN ('plv8', 'pljs')
+     ORDER BY CASE lanname WHEN 'plv8' THEN 1 WHEN 'pljs' THEN 2 END
+     LIMIT 1;
+
+    IF v_lang IS NULL THEN
+      RAISE EXCEPTION 'pl/jsonschema requires either "plv8" or "pljs" extension to be installed first'
+        USING HINT = 'Run CREATE EXTENSION plv8; or CREATE EXTENSION pljs; before CREATE EXTENSION pl_jsonschema;.';
+    END IF;
+  END IF;
+
+  -- 1. Load the AJV JSON Schema validator bundle function
+  EXECUTE $ajv_bundle$
+    CREATE OR REPLACE FUNCTION ajv()
+    RETURNS void AS
+    $$
+    if (typeof globalThis.console === 'undefined') {
+      globalThis.console = {
+        log: function() {},
+        warn: function() {},
+        error: function() {}
+      };
+    }
+__AJV_BUNDLE_JS__
+    globalThis.__pljsonschema_new_ajv = function() {
+      const proto_ajv = globalThis.ajv_class();
+      if (proto_ajv && typeof proto_ajv.constructor === 'function') {
+        return new proto_ajv.constructor({
+          allErrors: false,
+          strict: false,
+          validateFormats: false
+        });
+      }
+      return proto_ajv;
+    };
+
+    globalThis.__pljsonschema_has_ext_ref = function(node) {
+      if (!node || typeof node !== 'object') {
+        return false;
+      }
+      if (typeof node.$ref === 'string' && !node.$ref.startsWith('#')) {
+        return true;
+      }
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i++) {
+          if (globalThis.__pljsonschema_has_ext_ref(node[i])) {
+            return true;
+          }
+        }
+        return false;
+      }
+      const keys = Object.keys(node);
+      for (let i = 0; i < keys.length; i++) {
+        if (globalThis.__pljsonschema_has_ext_ref(node[keys[i]])) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    globalThis.__pljsonschema_compile = function(pl, schema_src, key, has_ext_ref) {
+      if (!pl.validator) {
+        pl.validator = Object.create(null);
+      }
+
+      let rows = null;
+      let sig = null;
+      if (has_ext_ref) {
+        rows = pl.execute(
+          `SELECT p.oid::pg_catalog.text AS oid,
+                  p.xmin::pg_catalog.text AS xmin,
+                  p.ctid::pg_catalog.text AS ctid,
+                  p.prosrc
+             FROM pg_catalog.pg_proc p
+             JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+            WHERE l.lanname = 'pl/jsonschema'
+            ORDER BY p.oid DESC`
+        );
+        sig = rows
+          ? rows.map(function(r) { return r.oid + ':' + r.xmin + ':' + r.ctid; }).join(',')
+          : '';
+        if (pl.ajv && pl.ajv_catalog_sig === sig && pl.validator[key]) {
+          return pl.validator[key];
+        }
+      } else if (pl.ajv && pl.validator[key]) {
+        return pl.validator[key];
+      }
+
+      let parsed_schema;
+      try {
+        parsed_schema = JSON.parse(schema_src);
+      } catch (e) {
+        throw new Error('pl/jsonschema: function body is not valid JSON');
+      }
+
+      if (
+        parsed_schema === null ||
+        Array.isArray(parsed_schema) ||
+        (typeof parsed_schema !== 'object' && typeof parsed_schema !== 'boolean')
+      ) {
+        throw new Error('pl/jsonschema: JSON Schema must be a JSON object or boolean');
+      }
+
+      const self_id = (typeof parsed_schema === 'object' && typeof parsed_schema.$id === 'string')
+        ? parsed_schema.$id
+        : null;
+
+      if (has_ext_ref) {
+        if (!pl.ajv || pl.ajv_catalog_sig !== sig) {
+          pl.ajv = globalThis.__pljsonschema_new_ajv();
+          pl.validator = Object.create(null);
+          if (rows) {
+            for (let i = 0; i < rows.length; i++) {
+              let s;
+              try {
+                s = JSON.parse(rows[i].prosrc);
+              } catch (_) {
+                continue;
+              }
+              if (
+                s &&
+                typeof s === 'object' &&
+                !Array.isArray(s) &&
+                typeof s.$id === 'string' &&
+                s.$id !== self_id &&
+                !pl.ajv.getSchema(s.$id)
+              ) {
+                try {
+                  pl.ajv.addSchema(s);
+                } catch (_) {
+                }
+              }
+            }
+          }
+          pl.ajv_catalog_sig = sig;
+        } else if (self_id !== null) {
+          pl.ajv.removeSchema(self_id);
+        }
+      } else {
+        if (!pl.ajv) {
+          pl.ajv = globalThis.__pljsonschema_new_ajv();
+        }
+        if (self_id !== null) {
+          pl.ajv.removeSchema(self_id);
+        }
+      }
+
+      let validator;
+      try {
+        validator = pl.ajv.compile(parsed_schema);
+      } catch (e) {
+        throw new Error('pl/jsonschema: ' + e.message);
+      }
+
+      pl.validator[key] = validator;
+      return validator;
+    };
+    $$ LANGUAGE $ajv_bundle$ || pg_catalog.quote_ident(v_lang);
+
+  -- 2. Call handler: transpiles a JSON Schema string into a JS validator function body
+  EXECUTE $handler_def$
+    CREATE OR REPLACE FUNCTION pljsonschema_call_handler()
+    RETURNS language_handler AS
+    $$
+      const pl = (typeof plv8 !== 'undefined') ? plv8 : pljs;
+      const schema_src = arguments[0];
+
+      if (typeof schema_src !== 'string') {
+        throw new Error('pl/jsonschema: handler must be called with a JSON Schema string');
+      }
+
+      if (typeof globalThis.__pljsonschema_compile === 'undefined') {
+        const rows = pl.execute(
+          `SELECT a.prosrc
+             FROM pg_catalog.pg_proc a
+             JOIN pg_catalog.pg_proc h
+               ON h.pronamespace = a.pronamespace
+              AND h.prolang = a.prolang
+             JOIN pg_catalog.pg_language l
+               ON l.lanplcallfoid = h.oid
+            WHERE l.lanname = 'pl/jsonschema'
+              AND a.proname = 'ajv'
+              AND a.pronargs = 0
+            LIMIT 1`
+        );
+        if (rows && rows.length === 1) {
+          (0, eval)('(function(){\n' + rows[0].prosrc + '\n})()');
+        } else {
+          pl.find_function('ajv')();
+        }
+      }
+
+      let parsed_schema;
+      try {
+        parsed_schema = JSON.parse(schema_src);
+      } catch (e) {
+        throw new Error('pl/jsonschema: function body is not valid JSON');
+      }
+
+      if (
+        parsed_schema === null ||
+        Array.isArray(parsed_schema) ||
+        (typeof parsed_schema !== 'object' && typeof parsed_schema !== 'boolean')
+      ) {
+        throw new Error('pl/jsonschema: JSON Schema must be a JSON object or boolean');
+      }
+
+      const has_ext_ref = globalThis.__pljsonschema_has_ext_ref(parsed_schema);
+
+      pl.ajv_catalog_sig = null;
+      if (typeof parsed_schema === 'object' && typeof parsed_schema.$id === 'string' && pl.ajv) {
+        pl.ajv.removeSchema(parsed_schema.$id);
+        pl.validator = Object.create(null);
+      }
+
+      globalThis.__pljsonschema_seq = (globalThis.__pljsonschema_seq || 0) + 1;
+      const raw_key = schema_src + '\0' + Date.now() + ':' + globalThis.__pljsonschema_seq + ':' + Math.random();
+
+      globalThis.__pljsonschema_compile(pl, schema_src, raw_key, has_ext_ref);
+
+      const schema_lit = JSON.stringify(schema_src)
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+      const key_lit = JSON.stringify(raw_key)
+        .replace(/\u2028/g, '\\u2028')
+        .replace(/\u2029/g, '\\u2029');
+
+      return `
+        {
+          const pl = (typeof plv8 !== 'undefined') ? plv8 : pljs;
+          let v = ${has_ext_ref ? 'null' : `pl.validator && pl.validator[${key_lit}]`};
+          if (!v) {
+            if (typeof globalThis.__pljsonschema_compile === 'undefined') {
+              const rows = pl.execute(
+                "SELECT a.prosrc FROM pg_catalog.pg_proc a JOIN pg_catalog.pg_proc h ON h.pronamespace = a.pronamespace AND h.prolang = a.prolang JOIN pg_catalog.pg_language l ON l.lanplcallfoid = h.oid WHERE l.lanname = 'pl/jsonschema' AND a.proname = 'ajv' AND a.pronargs = 0 LIMIT 1"
+              );
+              if (rows && rows.length === 1) {
+                (0, eval)('(function(){\\n' + rows[0].prosrc + '\\n})()');
+              } else {
+                pl.find_function('ajv')();
+              }
+            }
+            v = globalThis.__pljsonschema_compile(pl, ${schema_lit}, ${key_lit}, ${has_ext_ref});
+          }
+          return Boolean(v(arguments[0]));
+        }
+      `;
+    $$ LANGUAGE $handler_def$ || pg_catalog.quote_ident(v_lang);
+
+  -- 3. Validator: enforces (json) -> boolean signature and compiles the schema at CREATE FUNCTION time
+  EXECUTE $validator_def$
+    CREATE OR REPLACE FUNCTION pljsonschema_call_validator(func_oid oid)
+    RETURNS void
+    STRICT AS
+    $$
+      const pl = (typeof plv8 !== 'undefined') ? plv8 : pljs;
+      pl.ajv_catalog_sig = null;
+
+      const rows = pl.execute(
+        `SELECT p.proname::pg_catalog.text AS proname,
+                p.prosrc::pg_catalog.text AS prosrc,
+                p.pronargs::pg_catalog.int4 AS pronargs,
+                p.proretset,
+                p.prokind::pg_catalog.text AS prokind,
+                p.proargmodes IS NULL AS all_in_args,
+                p.prorettype = 'pg_catalog.bool'::pg_catalog.regtype::pg_catalog.oid AS returns_bool,
+                CASE WHEN p.pronargs = 1 THEN p.proargtypes[0] = 'pg_catalog.json'::pg_catalog.regtype::pg_catalog.oid ELSE false END AS arg_is_json,
+                l.lanname::pg_catalog.text AS lanname,
+                pg_catalog.has_language_privilege(p.prolang, 'USAGE') AS has_lang_priv,
+                pg_catalog.has_function_privilege(p.oid, 'EXECUTE') AS has_func_priv,
+                pg_catalog.current_setting('check_function_bodies') = 'on' AS check_bodies
+           FROM pg_catalog.pg_proc p
+           JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+          WHERE p.oid = $1`,
+        [func_oid]
+      );
+
+      if (!rows || rows.length !== 1) {
+        throw new Error('pl/jsonschema: function with OID ' + func_oid + ' does not exist');
+      }
+
+      const fn = rows[0];
+      if (fn.lanname !== 'pl/jsonschema') {
+        throw new Error(
+          'pl/jsonschema: language validation function called for language "' +
+          fn.lanname + '" instead of "pl/jsonschema"'
+        );
+      }
+
+      if (!fn.has_lang_priv) {
+        throw new Error('pl/jsonschema: permission denied for language "pl/jsonschema"');
+      }
+
+      if (!fn.has_func_priv) {
+        throw new Error('pl/jsonschema: permission denied for function "' + fn.proname + '"');
+      }
+
+      if (
+        fn.prokind !== 'f' ||
+        !fn.all_in_args ||
+        fn.pronargs !== 1 ||
+        !fn.arg_is_json ||
+        !fn.returns_bool ||
+        fn.proretset
+      ) {
+        throw new Error(
+          'pl/jsonschema: function "' + fn.proname +
+          '" must take a single argument of type json and return boolean'
+        );
+      }
+
+      if (fn.check_bodies) {
+        try {
+          pl.find_function(String(func_oid));
+        } catch (e) {
+          const msg = String(e && e.message ? e.message : e);
+          if (msg.indexOf('javascript function') !== -1 && msg.indexOf('does not exist') !== -1) {
+            const schema_src = fn.prosrc;
+            if (typeof globalThis.__pljsonschema_compile === 'undefined') {
+              const ajv_rows = pl.execute(
+                `SELECT a.prosrc
+                   FROM pg_catalog.pg_proc a
+                   JOIN pg_catalog.pg_proc h
+                     ON h.pronamespace = a.pronamespace
+                    AND h.prolang = a.prolang
+                   JOIN pg_catalog.pg_language l
+                     ON l.lanplcallfoid = h.oid
+                  WHERE l.lanname = 'pl/jsonschema'
+                    AND a.proname = 'ajv'
+                    AND a.pronargs = 0
+                  LIMIT 1`
+              );
+              if (ajv_rows && ajv_rows.length === 1) {
+                (0, eval)('(function(){\n' + ajv_rows[0].prosrc + '\n})()');
+              } else {
+                pl.find_function('ajv')();
+              }
+            }
+            let parsed_schema;
+            try {
+              parsed_schema = JSON.parse(schema_src);
+            } catch (_) {
+              throw new Error('pl/jsonschema: function body is not valid JSON');
+            }
+            if (
+              parsed_schema === null ||
+              Array.isArray(parsed_schema) ||
+              (typeof parsed_schema !== 'object' && typeof parsed_schema !== 'boolean')
+            ) {
+              throw new Error('pl/jsonschema: JSON Schema must be a JSON object or boolean');
+            }
+            const has_ext_ref = globalThis.__pljsonschema_has_ext_ref(parsed_schema);
+            globalThis.__pljsonschema_seq = (globalThis.__pljsonschema_seq || 0) + 1;
+            const raw_key = schema_src + '\0' + Date.now() + ':' + globalThis.__pljsonschema_seq + ':' + Math.random();
+            globalThis.__pljsonschema_compile(pl, schema_src, raw_key, has_ext_ref);
+          } else {
+            throw e;
+          }
+        }
+      }
+      if (typeof plv8 !== 'undefined') {
+        return '';
+      }
+    $$ LANGUAGE $validator_def$ || pg_catalog.quote_ident(v_lang);
+
+  -- 4. Register the pl/jsonschema procedural language
+  CREATE OR REPLACE TRUSTED LANGUAGE "pl/jsonschema"
+    HANDLER pljsonschema_call_handler
+    VALIDATOR pljsonschema_call_validator;
+
+  -- 5. Revoke direct PUBLIC execution on internal helper functions
+  REVOKE ALL ON FUNCTION ajv() FROM PUBLIC;
+  REVOKE ALL ON FUNCTION pljsonschema_call_handler() FROM PUBLIC;
+  REVOKE ALL ON FUNCTION pljsonschema_call_validator(oid) FROM PUBLIC;
+END;
+$pljsonschema_install$ LANGUAGE plpgsql;

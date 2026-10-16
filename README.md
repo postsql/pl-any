@@ -15,4 +15,4 @@ Every directory under `pl_any/` is a **100% pure-SQL/JS/WASM PostgreSQL extensio
 | `pl_micropython_v8/` | `pl_micropython_v8` | `pl_micropython_v8`, `"pl/micropython+v8"`, `plmicropython`, `"pl/micropython"` | MicroPython v1.24.1 WebAssembly runtime on V8 / QuickJS |
 | `pl_datalog/` | `pl_datalog` | `pl_datalog`, `"pl/datalog"`, `datalog`, `pldatalog` | Stratified Datalog (semi-naive fixpoint + WASM bitset joins) on V8 |
 | `pl_pgq/` | `pl_pgq` | `pl_pgq`, `"CREATE PROPERTY GRAPH"`, `property_graph`, `sqlpgq_v8` | ISO/IEC 9075-16 SQL/PGQ Property Graph DDL & `GRAPH_TABLE` compiler on V8 |
-| `pl_jsonschema/` | `pl_jsonschema` | `pl_jsonschema`, `jsonschema` | JSON Schema Draft 2020-12 validator procedural language on V8 / QuickJS |
+| `pl_jsonschema/` | `pl_jsonschema`, `"pl-jsonschema"` | `"pl/jsonschema"` | JSON Schema (Draft-07 / Draft 2020-12) validator procedural language on V8 / QuickJS |

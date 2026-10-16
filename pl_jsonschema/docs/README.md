@@ -188,6 +188,26 @@ The test suite (`sql/pl_jsonschema.sql`) covers:
 - Deferred compilation when functions are created with `SET check_function_bodies = off`
 - Extension relocation (`ALTER EXTENSION pl_jsonschema SET SCHEMA ...`) and resilience to `search_path` changes
 - Privilege and security checks (`REVOKE ALL ... FROM PUBLIC` on internal functions, unprivileged role execution and function creation)
+- Draft-07 `"format"` annotations (`date-time`) and union types (`["null", "object"]` with nested `properties`)
+
+---
+
+## Comparative Benchmarks (`pl/v8` & `pl/js` vs. `supabase/pg_jsonschema`)
+
+Across **251,755** GitHub Archive JSON records (`1.04 GB` raw JSON, `391.8 MB` LZ4-compressed in PostgreSQL 18.6) validated against 15 event-specific Draft-07 JSON Schemas (`1.75 KB` to `55.4 KB`):
+
+| Engine / Mode | End-to-End Total (`ms`) | Net Validation Above LZ4 (`ms`) | Net Validation (`µs/row`) | Speedup vs. `pg_jsonschema` Uncompiled (End-to-End / Net) |
+| :--- | ---: | ---: | ---: | ---: |
+| **Baseline Index Scan + LZ4 Decompression** | **`3,428.52 ms`** | `0.00 ms` | `—` | `—` |
+| **1. `pl/jsonschema` on `pl/v8` (V8 TurboFan JIT)** | **`4,870.00 ms`** | **`1,441.48 ms`** | **`5.73 µs/row`** | **`9.14x` / `28.49x` faster** |
+| **2. `supabase/pg_jsonschema` Compiled (`json_matches_compiled_schema`)** | **`5,497.83 ms`** | **`2,069.31 ms`** | **`8.22 µs/row`** | **`8.09x` / `19.84x` faster** |
+| **3. `pl/jsonschema` on `pl/js` (QuickJS Bytecode)** | **`9,237.10 ms`** | **`5,808.58 ms`** | **`23.07 µs/row`** | **`4.82x` / `7.07x` faster** |
+| **4. `supabase/pg_jsonschema` Uncompiled (`json_matches_schema`)** | **`44,493.29 ms`** | **`41,064.77 ms`** | **`163.11 µs/row`** | `1.00x` / `1.00x` (baseline) |
+
+See:
+- [Full Comparative Benchmark Report (`docs/BENCHMARK_REPORT.md`)](BENCHMARK_REPORT.md)
+- [Benchmark Execution Walkthrough (`docs/BENCHMARK_WALKTHROUGH.md`)](BENCHMARK_WALKTHROUGH.md)
+- [Raw 15-Event Benchmark Dataset (`benchmarks/dev02_results.json`)](../benchmarks/dev02_results.json)
 
 ---
 
@@ -195,4 +215,4 @@ The test suite (`sql/pl_jsonschema.sql`) covers:
 
 1. **`ajv() RETURNS void`**: Evaluates the bundled Ajv library (`ajv_bundle.sql.gz`), exposing `globalThis.ajv_class()` along with the internal helper `globalThis.__pljsonschema_compile(...)` in the current session's JS context.
 2. **`pljsonschema_call_handler() RETURNS language_handler`**: Invoked by `plv8` or `pljs` with the target `"pl/jsonschema"` function's source (`prosrc`) as `arguments[0]`. Parses and validates the JSON Schema, compiles it via `pl.ajv.compile(schema)` (automatically loading any referenced `$id` schemas from `pg_catalog.pg_proc` when external `$ref`s are present), caches the compiled validator in `pl.validator`, and returns a block-scoped JavaScript function body that validates `arguments[0]` and returns a `boolean`.
-3. **`pljsonschema_call_validator(func_oid oid) RETURNS void`**: Invoked at `CREATE FUNCTION` time. Verifies the function signature (`(json) -> boolean`) and permissions in `pg_catalog.pg_proc`, and when `check_function_bodies = on`, triggers compilation via `pl.find_function(String(func_oid))` so invalid JSON or invalid JSON Schema definitions are rejected immediately at `CREATE FUNCTION` time.
+3. **`pljsonschema_call_validator(func_oid oid) RETURNS void`**: Invoked at `CREATE FUNCTION` time. Verifies the function signature (`(json) -> boolean`) and permissions in `pg_catalog.pg_proc`, and when `check_function_bodies = on`, triggers compilation via `pl.find_function(String(func_oid))` (with direct Ajv compilation fallback on `postsql/plv8` `v4.0`) so invalid JSON or invalid JSON Schema definitions are rejected immediately at `CREATE FUNCTION` time.

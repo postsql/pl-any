@@ -12,8 +12,14 @@ PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
+.PHONY: installcheck-plv8 installcheck-pljs rebuild-bundle
+
 installcheck-plv8:
 	$(MAKE) installcheck PG_CONFIG=$(PG_CONFIG) REGRESS_OPTS="$(REGRESS_PLV8_PREP)"
 
 installcheck-pljs:
 	$(MAKE) installcheck PG_CONFIG=$(PG_CONFIG) REGRESS_OPTS="$(REGRESS_PLJS_PREP)"
+
+rebuild-bundle: pl_jsonschema.sql.in ajv_bundle.sql.gz
+	python3 $(srcdir)/scripts/build_bundle.py
+
