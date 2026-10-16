@@ -5,7 +5,6 @@
 
 \set VERBOSITY terse
 SET client_min_messages = warning;
-SET pl_jsonschema.engine = 'pljs';
 
 DROP EXTENSION IF EXISTS pl_jsonschema CASCADE;
 DROP EXTENSION IF EXISTS "pl-jsonschema" CASCADE;

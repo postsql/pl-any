@@ -1,6 +1,6 @@
 # Top-level Makefile for pl-any (pure-SQL/JS/WASM trusted procedural languages)
 
-SUBDIRS ?= $(sort $(wildcard pl_*))
+SUBDIRS ?= $(sort $(patsubst %/Makefile,%,$(wildcard pl_*/Makefile)))
 PG_CONFIG ?= pg_config
 
 .PHONY: all install installcheck clean $(SUBDIRS)

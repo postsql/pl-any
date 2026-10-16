@@ -208,6 +208,8 @@ See:
 - [Full Comparative Benchmark Report (`docs/BENCHMARK_REPORT.md`)](BENCHMARK_REPORT.md)
 - [Benchmark Execution Walkthrough (`docs/BENCHMARK_WALKTHROUGH.md`)](BENCHMARK_WALKTHROUGH.md)
 - [Raw 15-Event Benchmark Dataset (`benchmarks/dev02_results.json`)](../benchmarks/dev02_results.json)
+- [4-Way Comparative Benchmark Runner (`benchmarks/run_benchmarks_on_dev02.sh`)](../benchmarks/run_benchmarks_on_dev02.sh)
+- [GitHub Archive Schema Generator (`benchmarks/generate_schemas.py`)](../benchmarks/generate_schemas.py) & [15 Event JSON Schemas (`benchmarks/schemas/`)](../benchmarks/schemas/)
 
 ---
 

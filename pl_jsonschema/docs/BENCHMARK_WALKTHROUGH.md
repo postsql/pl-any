@@ -66,3 +66,6 @@ flowchart TD
 | :--- | :--- |
 | [`docs/BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) | Full 4-way comparative benchmark report (`pl/jsonschema` on `pl/v8`, `pl/jsonschema` on `pl/js`, `pg_jsonschema` Compiled, and `pg_jsonschema` Uncompiled) across all 15 GitHub Archive event types on `dev02`. |
 | [`benchmarks/dev02_results.json`](../benchmarks/dev02_results.json) | Raw JSON benchmark metrics collected from `dev02` across all 15 event types and all 4 validation modes. |
+| [`benchmarks/run_benchmarks_on_dev02.sh`](../benchmarks/run_benchmarks_on_dev02.sh) | Reproducible 4-way comparative benchmark deployment and execution harness for `dev02`. |
+| [`benchmarks/generate_schemas.py`](../benchmarks/generate_schemas.py) | Schema inference and generator script for GitHub Archive `2025-01-15-14.json`. |
+| [`benchmarks/schemas/`](../benchmarks/schemas/) | All 15 event-specific Draft-07 JSON Schemas (`<EventType>.schema.json`) benchmarked across `251,755` rows. |
