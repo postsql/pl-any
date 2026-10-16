@@ -1,0 +1,340 @@
+--
+-- 02_graph_table_pg19.sql
+-- Tests PG 19 graph_table.sql queries and semantics:
+--   - GRAPH_TABLE both WITHOUT AS (...) and WITH AS (...)
+--   - Abbreviated and full edge patterns, label expressions (|, &, !, %)
+--   - SQL/PGQ Section 6.5 property resolution across multi-label elements
+--   - Cyclic patterns ((a)->(b)->(a), (a)-[b]->(a)-[b]->(a), (a)-[c]-(a))
+--   - Table inheritance, declarative partitioning, views, and prepared statements
+--   - Negative validation error checks
+--
+
+CREATE SCHEMA pgq_gt_test;
+SET search_path = pgq_gt_test, public;
+
+CREATE TABLE products (
+  product_no integer PRIMARY KEY,
+  name varchar,
+  price numeric
+);
+
+CREATE TABLE customers (
+  customer_id integer PRIMARY KEY,
+  name varchar,
+  address varchar
+);
+
+CREATE TABLE orders (
+  order_id integer PRIMARY KEY,
+  ordered_when date
+);
+
+CREATE TABLE order_items (
+  order_items_id integer PRIMARY KEY,
+  order_id integer REFERENCES orders (order_id),
+  product_no integer REFERENCES products (product_no),
+  quantity integer
+);
+
+CREATE TABLE customer_orders (
+  customer_orders_id integer PRIMARY KEY,
+  customer_id integer REFERENCES customers (customer_id),
+  order_id integer REFERENCES orders (order_id)
+);
+
+INSERT INTO products VALUES
+  (1, 'Product1', 100),
+  (2, 'Product2', 200),
+  (3, 'Product3', 300);
+
+INSERT INTO customers VALUES
+  (1, 'Customer1', 'US'),
+  (2, 'Customer2', 'CA'),
+  (3, 'Customer3', 'GL');
+
+INSERT INTO orders VALUES
+  (1, '2024-01-01'),
+  (2, '2024-01-02'),
+  (3, '2024-01-03');
+
+INSERT INTO order_items (order_items_id, order_id, product_no, quantity) VALUES
+  (1, 1, 1, 5),
+  (2, 1, 2, 10),
+  (3, 2, 1, 7);
+
+INSERT INTO customer_orders (customer_orders_id, customer_id, order_id) VALUES
+  (1, 1, 1),
+  (2, 2, 3);
+
+CREATE FUNCTION myshop() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (
+    products,
+    customers,
+    orders
+      DEFAULT LABEL
+      LABEL lists
+  )
+  EDGE TABLES (
+    order_items KEY (order_items_id)
+      SOURCE KEY (order_id) REFERENCES orders
+      DESTINATION KEY (product_no) REFERENCES products,
+    customer_orders KEY (customer_orders_id)
+      SOURCE KEY (customer_id) REFERENCES customers
+      DESTINATION KEY (order_id) REFERENCES orders
+  )
+$$;
+
+-- 1. Single vertex queries without AS (...) and with AS (...)
+SELECT customer_name FROM GRAPH_TABLE(myshop(), 'MATCH (c IS customers) COLUMNS (c.name AS customer_name)') ORDER BY customer_name;
+SELECT customer_name FROM GRAPH_TABLE(myshop(), 'MATCH (c IS customers WHERE c.address = ''US'') COLUMNS (c.name AS customer_name)');
+SELECT * FROM GRAPH_TABLE(myshop(), 'MATCH (c : customers WHERE c.address = ''US'') COLUMNS (c.name AS customer_name, c.address)') AS gt(customer_name varchar, address varchar);
+
+-- 2. Directed 1-hop and 2-hop edge patterns
+SELECT customer_name FROM GRAPH_TABLE(myshop(), 'MATCH (c IS customers)-[IS customer_orders]->(o IS orders) COLUMNS (c.name AS customer_name)') ORDER BY customer_name;
+SELECT customer_name, ordered_when FROM GRAPH_TABLE(myshop(), 'MATCH (c IS customers)-[co IS customer_orders]->(o IS orders WHERE o.ordered_when = date ''2024-01-01'') COLUMNS (c.name AS customer_name, o.ordered_when)');
+SELECT name FROM GRAPH_TABLE(myshop(), 'MATCH (o IS orders)<-[IS customer_orders]-(c IS customers) COLUMNS (c.name)') ORDER BY name;
+
+-- 3. Multi-hop path through orders to products
+SELECT c_name, p_name, qty
+  FROM GRAPH_TABLE(
+    myshop(),
+    'MATCH (c IS customers)-[IS customer_orders]->(o IS orders)-[oi IS order_items]->(p IS products) COLUMNS (c.name AS c_name, p.name AS p_name, oi.quantity AS qty)'
+  )
+ ORDER BY c_name, p_name;
+
+-- 4. Disjunctive label expressions (customers | products)
+SELECT name FROM GRAPH_TABLE(myshop(), 'MATCH (n IS customers | products) COLUMNS (n.name)') ORDER BY name;
+
+-- 5. SQL/PGQ Section 6.5 property resolution and multi-label elements (g1 from PG 19 graph_table.sql)
+CREATE TABLE v1 (
+  id int PRIMARY KEY,
+  vprop1 int,
+  vprop2 int
+);
+
+CREATE TABLE v2 (
+  id1 int,
+  id2 int,
+  vprop1 int,
+  vprop3 int,
+  PRIMARY KEY (id1, id2)
+);
+
+CREATE TABLE v3 (
+  id int PRIMARY KEY,
+  vprop2 int
+);
+
+CREATE TABLE e1_1 (
+  id int PRIMARY KEY,
+  in_id int,
+  out_id int,
+  eprop1 int,
+  eprop2 int
+);
+
+CREATE TABLE e1_2_1 (
+  id int PRIMARY KEY,
+  in_id int,
+  out_id1 int,
+  out_id2 int,
+  eprop1 int
+);
+
+CREATE TABLE e1_2_2 (
+  id int PRIMARY KEY,
+  in_id int,
+  out_id1 int,
+  out_id2 int,
+  eprop2 int
+);
+
+CREATE TABLE e2_3 (
+  id int PRIMARY KEY,
+  in_id1 int,
+  in_id2 int,
+  out_id int,
+  eprop1 int
+);
+
+INSERT INTO v1 VALUES (1, 10, 100), (2, 2000, 200);
+INSERT INTO v2 VALUES (1, 1, 10, 300), (1, 2, 20, 400);
+INSERT INTO v3 VALUES (1, 200), (2, 500);
+INSERT INTO e1_1 VALUES (1, 1, 2, 110, 120), (2, 1, 1, 111, 220);
+INSERT INTO e1_2_1 VALUES (1, 1, 1, 1, 121), (2, 2, 1, 2, 212);
+INSERT INTO e1_2_2 VALUES (1, 1, 1, 2, 122), (2, 2, 1, 1, 222);
+INSERT INTO e2_3 VALUES (1, 1, 1, 1, 231), (2, 1, 2, 2, 232);
+
+CREATE FUNCTION g1() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (
+    v1 DEFAULT LABEL LABEL vl1 PROPERTIES (id, vprop1) LABEL vl2 PROPERTIES (vprop2),
+    v2 KEY (id1, id2) DEFAULT LABEL LABEL vl1 PROPERTIES (id1 + id2 AS id, vprop1) LABEL vl3 PROPERTIES (vprop3),
+    v3 DEFAULT LABEL LABEL vl2 PROPERTIES (vprop2)
+  )
+  EDGE TABLES (
+    e1_1 KEY (id)
+      SOURCE KEY (in_id) REFERENCES v1 (id)
+      DESTINATION KEY (out_id) REFERENCES v1 (id)
+      DEFAULT LABEL PROPERTIES (eprop1, eprop2) LABEL el1 PROPERTIES (eprop1),
+    e1_2_1 KEY (id)
+      SOURCE KEY (in_id) REFERENCES v1 (id)
+      DESTINATION KEY (out_id1, out_id2) REFERENCES v2 (id1, id2)
+      DEFAULT LABEL LABEL el1 PROPERTIES (eprop1),
+    e1_2_2 KEY (id)
+      SOURCE KEY (in_id) REFERENCES v1 (id)
+      DESTINATION KEY (out_id1, out_id2) REFERENCES v2 (id1, id2)
+      DEFAULT LABEL LABEL el2 PROPERTIES (eprop2),
+    e2_3 KEY (id)
+      SOURCE KEY (in_id1, in_id2) REFERENCES v2 (id1, id2)
+      DESTINATION KEY (out_id) REFERENCES v3 (id)
+      DEFAULT LABEL LABEL el1 PROPERTIES (eprop1)
+  )
+$$;
+
+-- Section 6.5: querying (a IS vl1 | vl2) exposes id, vprop1, vprop2;
+-- v1 defines vprop2 via vl2, v2 has NULL for vprop2, v3 has NULL for id and vprop1
+SELECT id, vprop1, vprop2
+  FROM GRAPH_TABLE(g1(), 'MATCH (a IS vl1 | vl2) COLUMNS (a.id, a.vprop1, a.vprop2)')
+ ORDER BY id NULLS LAST, vprop1 NULLS LAST, vprop2;
+
+-- Multi-table edge union
+SELECT avp1, b_ep1, cvp1
+  FROM GRAPH_TABLE(g1(), 'MATCH (a)-[b IS el1]->(c IS vl1) COLUMNS (a.vprop1 AS avp1, b.eprop1 AS b_ep1, c.vprop1 AS cvp1)')
+ ORDER BY avp1, b_ep1, cvp1;
+
+-- Undirected edge matching (`-[b]-`)
+SELECT avp1, b_ep1, cvp1
+  FROM GRAPH_TABLE(g1(), 'MATCH (a IS v1)-[b IS e1_2_1]-(c) COLUMNS (a.vprop1 AS avp1, b.eprop1 AS b_ep1, c.vprop1 AS cvp1)')
+ ORDER BY avp1, b_ep1, cvp1;
+
+-- 6. Cyclic path patterns (g2 from PG 19 graph_table.sql)
+CREATE TABLE n1 (id int PRIMARY KEY, name varchar);
+CREATE TABLE n2 (id int PRIMARY KEY, name varchar);
+CREATE TABLE n3 (id int PRIMARY KEY, name varchar);
+CREATE TABLE en1n2 (id int PRIMARY KEY, n1_id int REFERENCES n1(id), n2_id int REFERENCES n2(id), ename varchar);
+CREATE TABLE en2n1 (id int PRIMARY KEY, n2_id int REFERENCES n2(id), n1_id int REFERENCES n1(id), ename varchar);
+CREATE TABLE en1n1 (id int PRIMARY KEY, in_n1_id int REFERENCES n1(id), out_n1_id int REFERENCES n1(id), ename varchar);
+
+INSERT INTO n1 VALUES (1, 'n1_1'), (2, 'n1_2'), (3, 'n1_3');
+INSERT INTO n2 VALUES (1, 'n2_1'), (2, 'n2_2'), (3, 'n2_3');
+INSERT INTO n3 VALUES (1, 'n3_1'), (2, 'n3_2');
+INSERT INTO en1n2 VALUES (1, 2, 1, 'e12_21'), (2, 1, 2, 'e12_12'), (3, 2, 3, 'e12_23');
+INSERT INTO en2n1 VALUES (1, 1, 2, 'e21_12'), (2, 2, 3, 'e21_23'), (3, 3, 2, 'e21_32');
+INSERT INTO en1n1 VALUES (1, 1, 1, 'e11_11'), (2, 1, 2, 'e11_12');
+
+CREATE FUNCTION g2() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (
+    n1 LABEL l1 PROPERTIES (name),
+    n2 LABEL l1 PROPERTIES (name),
+    n3 LABEL l1 PROPERTIES (name)
+  )
+  EDGE TABLES (
+    en1n2 SOURCE n1 DESTINATION n2 LABEL l2 PROPERTIES (ename),
+    en2n1 SOURCE n2 DESTINATION n1 LABEL l2 PROPERTIES (ename),
+    en1n1
+      SOURCE KEY (in_n1_id) REFERENCES n1
+      DESTINATION KEY (out_n1_id) REFERENCES n1
+      LABEL l2 PROPERTIES (ename)
+  )
+$$;
+
+-- Cyclic vertex pattern: (a)->(b)->(a)
+SELECT aname, bname
+  FROM GRAPH_TABLE(g2(), 'MATCH (a)->(b)->(a) COLUMNS (a.name AS aname, b.name AS bname)')
+ ORDER BY aname, bname;
+
+-- Cyclic vertex and edge pattern: (a)-[b]->(a)-[b]->(a)
+SELECT aname, bname
+  FROM GRAPH_TABLE(g2(), 'MATCH (a)-[b]->(a)-[b]->(a) COLUMNS (a.name AS aname, b.ename AS bname)')
+ ORDER BY aname, bname;
+
+-- Undirected self-loop: (a)-[c]-(a) (emitted once per self-loop, not duplicated)
+SELECT aname, cname
+  FROM GRAPH_TABLE(g2(), 'MATCH (a)-[c]-(a) COLUMNS (a.name AS aname, c.ename AS cname)')
+ ORDER BY aname, cname;
+
+-- 7. Table inheritance and declarative partitioning (g3, g4)
+CREATE TABLE pv_parent (id int PRIMARY KEY, kind text);
+CREATE TABLE pv_child (extra text) INHERITS (pv_parent);
+CREATE TABLE pe_link (id int PRIMARY KEY, src int, dst int);
+
+INSERT INTO pv_parent VALUES (1, 'parent_row');
+INSERT INTO pv_child VALUES (2, 'child_row', 'bonus');
+INSERT INTO pe_link VALUES (10, 1, 2);
+
+CREATE FUNCTION g_inh() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (pv_parent KEY (id) PROPERTIES (id, kind))
+  EDGE TABLES (
+    pe_link KEY (id)
+      SOURCE KEY (src) REFERENCES pv_parent (id)
+      DESTINATION KEY (dst) REFERENCES pv_parent (id)
+  )
+$$;
+
+SELECT s_kind, d_kind
+  FROM GRAPH_TABLE(g_inh(), 'MATCH (a)-[e]->(b) COLUMNS (a.kind AS s_kind, b.kind AS d_kind)');
+
+-- 8. Views and Prepared Statements
+CREATE VIEW shop_customer_orders_v AS
+  SELECT customer_name, ordered_when
+    FROM GRAPH_TABLE(myshop(), 'MATCH (c IS customers)-[IS customer_orders]->(o IS orders) COLUMNS (c.name AS customer_name, o.ordered_when)');
+
+SELECT * FROM shop_customer_orders_v ORDER BY customer_name;
+
+PREPARE pq_shop(varchar) AS
+  SELECT customer_name, ordered_when
+    FROM GRAPH_TABLE(myshop(), 'MATCH (c IS customers)-[IS customer_orders]->(o IS orders) COLUMNS (c.name AS customer_name, o.ordered_when)')
+   WHERE customer_name = $1;
+
+EXECUTE pq_shop('Customer1');
+DEALLOCATE pq_shop;
+
+-- 9. Negative error tests from PG 19 graph_table.sql
+
+-- 9a. Non-existent property graph name
+SELECT * FROM GRAPH_TABLE('nonexistent_graph', 'MATCH (a) COLUMNS (a.id)') AS gt(id int);
+
+-- 9b. Ordinary table name passed to GRAPH_TABLE
+SELECT * FROM GRAPH_TABLE('customers', 'MATCH (a) COLUMNS (a.id)') AS gt(id int);
+
+-- 9c. Consecutive vertices without edge
+SELECT * FROM GRAPH_TABLE(myshop(), 'MATCH (a)(b) COLUMNS (a.name)') AS gt(name varchar);
+
+-- 9d. Consecutive edges without vertex
+SELECT * FROM GRAPH_TABLE(myshop(), 'MATCH (a)->->(b) COLUMNS (a.name)') AS gt(name varchar);
+
+-- 9e. Edge without destination vertex
+SELECT * FROM GRAPH_TABLE(myshop(), 'MATCH (a)-> COLUMNS (a.name)') AS gt(name varchar);
+
+-- 9f. SELECT v.* star projection in COLUMNS
+SELECT * FROM GRAPH_TABLE(myshop(), 'MATCH (c IS customers) COLUMNS (c.*)') AS gt(name varchar);
+
+-- 9g. Aggregate function in unquantified COLUMNS
+SELECT * FROM GRAPH_TABLE(myshop(), 'MATCH (c IS customers) COLUMNS (count(c.name) AS cnt)') AS gt(cnt bigint);
+
+-- 9h. Window function in COLUMNS
+SELECT * FROM GRAPH_TABLE(myshop(), 'MATCH (c IS customers) COLUMNS (row_number() OVER () AS rn)') AS gt(rn bigint);
+
+-- 9i. Non-existent label
+SELECT * FROM GRAPH_TABLE(myshop(), 'MATCH (c IS unknown_label) COLUMNS (c.name)') AS gt(name varchar);
+
+-- 9j. Edge label used on vertex
+SELECT * FROM GRAPH_TABLE(myshop(), 'MATCH (c IS customer_orders) COLUMNS (c.customer_orders_id)') AS gt(id int);
+
+-- 9k. Non-existent property on element variable
+SELECT * FROM GRAPH_TABLE(myshop(), 'MATCH (c IS customers) COLUMNS (c.nonexistent_prop)') AS gt(val text);
+
+-- 9l. Non-local element variable referenced inside another element's WHERE clause
+SELECT * FROM GRAPH_TABLE(
+  myshop(),
+  'MATCH (c IS customers)-[IS customer_orders]->(o IS orders WHERE o.order_id = c.customer_id) COLUMNS (c.name)'
+) AS gt(name varchar);
+
+-- 9m. Cyclic variable bound to both vertex and edge
+SELECT * FROM GRAPH_TABLE(g2(), 'MATCH (a)-[a]->(b) COLUMNS (a.name)') AS gt(name varchar);
+
+DROP SCHEMA pgq_gt_test CASCADE;

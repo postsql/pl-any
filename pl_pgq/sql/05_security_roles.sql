@@ -1,0 +1,66 @@
+--
+-- 05_security_roles.sql
+-- Verifies REVOKE ALL ON FUNCTION ... FROM PUBLIC on internal functions and
+-- table-level ACL enforcement for unprivileged roles using LANGUAGE "CREATE PROPERTY GRAPH"
+-- and GRAPH_TABLE.
+--
+
+CREATE SCHEMA pgq_sec_test;
+SET search_path = pgq_sec_test, public;
+
+CREATE TABLE pub_nodes (id int PRIMARY KEY, label text);
+CREATE TABLE pub_edges (id int PRIMARY KEY, s int REFERENCES pub_nodes(id), d int REFERENCES pub_nodes(id));
+CREATE TABLE secret_nodes (id int PRIMARY KEY, secret text);
+
+INSERT INTO pub_nodes VALUES (1, 'one'), (2, 'two');
+INSERT INTO pub_edges VALUES (10, 1, 2);
+INSERT INTO secret_nodes VALUES (1, 'top_secret');
+
+DROP ROLE IF EXISTS regress_pgq_unpriv;
+CREATE ROLE regress_pgq_unpriv;
+
+GRANT USAGE, CREATE ON SCHEMA pgq_sec_test TO regress_pgq_unpriv;
+GRANT SELECT ON pub_nodes, pub_edges TO regress_pgq_unpriv;
+-- Note: secret_nodes is NOT granted to regress_pgq_unpriv
+
+CREATE FUNCTION secret_graph() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (secret_nodes)
+$$;
+GRANT EXECUTE ON FUNCTION secret_graph() TO regress_pgq_unpriv;
+
+SET ROLE regress_pgq_unpriv;
+
+-- 1. Direct calls to internal compiler/handler/support functions must be denied
+SELECT public.pgq_compiler_bundle();
+SELECT public.pgq_infer_columns_tsv('SELECT 1', 'MATCH (a) COLUMNS (a.id)');
+SELECT public.pgq_compile_graph_table_tsv('secret_graph()', 'MATCH (a) COLUMNS (a.id)', '[]', '[]', '');
+
+-- 2. Unprivileged user can define a property graph on accessible tables and query it via GRAPH_TABLE
+CREATE FUNCTION user_pub_graph() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (pub_nodes)
+  EDGE TABLES (
+    pub_edges
+      SOURCE KEY (s) REFERENCES pub_nodes
+      DESTINATION KEY (d) REFERENCES pub_nodes
+  )
+$$;
+
+SELECT src_lbl, dst_lbl
+  FROM GRAPH_TABLE(
+    user_pub_graph(),
+    'MATCH (a IS pub_nodes)-[e IS pub_edges]->(b IS pub_nodes) COLUMNS (a.label AS src_lbl, b.label AS dst_lbl)'
+  );
+
+-- 3. Unprivileged user cannot read restricted tables via GRAPH_TABLE
+SELECT secret
+  FROM GRAPH_TABLE(
+    secret_graph(),
+    'MATCH (s IS secret_nodes) COLUMNS (s.secret)'
+  ) AS gt(secret text);
+
+RESET ROLE;
+
+DROP SCHEMA pgq_sec_test CASCADE;
+DROP ROLE regress_pgq_unpriv;

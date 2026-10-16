@@ -1,0 +1,373 @@
+--
+-- 01_create_property_graph.sql
+-- Tests LANGUAGE "CREATE PROPERTY GRAPH" (and aliases), PK/FK auto-discovery,
+-- label/property clauses, WebAssembly lexer activation, and all PG 19
+-- create_property_graph.sql semantic validation checks.
+--
+CREATE EXTENSION IF NOT EXISTS plv8;
+CREATE EXTENSION IF NOT EXISTS pl_pgq;
+-- Verify WebAssembly character classifier module is active inside V8
+SELECT (
+  SELECT p.prosrc FROM pg_catalog.pg_proc p WHERE p.proname = 'pgq_compiler_bundle'
+) IS NOT NULL AS bundle_installed;
+ bundle_installed 
+------------------
+ t
+(1 row)
+
+SELECT pgq_wasm_active() AS wasm_active;
+ wasm_active 
+-------------
+ t
+(1 row)
+
+CREATE SCHEMA pgq_ddl_test;
+SET search_path = pgq_ddl_test, public;
+-- Basic tables
+CREATE TABLE t1 (a int PRIMARY KEY, b text, c numeric);
+CREATE TABLE t2 (i int PRIMARY KEY, j int REFERENCES t1(a), k text);
+CREATE TABLE t3 (x int, y int, z text, PRIMARY KEY (x, y));
+CREATE TABLE t4 (
+  id int PRIMARY KEY,
+  t1_a int REFERENCES t1(a),
+  t3_x int,
+  t3_y int,
+  w int,
+  FOREIGN KEY (t3_x, t3_y) REFERENCES t3(x, y)
+);
+-- 1. Minimal property graph using PK/FK auto-discovery and default labels/properties
+CREATE FUNCTION g_minimal() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (t1, t3)
+  EDGE TABLES (
+    t4 SOURCE t1 DESTINATION t3
+  )
+$$;
+SELECT (g_minimal())::jsonb - 'vertices' - 'edges' - 'property_types';
+                                ?column?                                
+------------------------------------------------------------------------
+ {"graph_name": "g_minimal", "is_temporary": false, "__pgq_version": 1}
+(1 row)
+
+SELECT jsonb_array_length((g_minimal())::jsonb -> 'vertices') AS num_vertices,
+       jsonb_array_length((g_minimal())::jsonb -> 'edges') AS num_edges;
+ num_vertices | num_edges 
+--------------+-----------
+            2 |         1
+(1 row)
+
+-- 2. Language aliases ("create property graph", property_graph, sqlpgq_v8)
+CREATE FUNCTION g_alias_lower() RETURNS property_graph
+LANGUAGE "create property graph" AS $$
+  NODE TABLES (t1)
+$$;
+CREATE FUNCTION g_alias_ident() RETURNS property_graph
+LANGUAGE property_graph AS $$
+  VERTEX TABLES (t1)
+$$;
+CREATE FUNCTION g_alias_v8() RETURNS "PROPERTY GRAPH"
+LANGUAGE sqlpgq_v8 AS $$
+  CREATE PROPERTY GRAPH g_explicit_hdr
+  VERTEX TABLES (t1)
+$$;
+SELECT (g_alias_lower())::jsonb ->> 'graph_name' AS g1_name,
+       (g_alias_ident())::jsonb ->> 'graph_name' AS g2_name,
+       (g_alias_v8())::jsonb ->> 'graph_name' AS g3_name;
+    g1_name    |    g2_name    |    g3_name     
+---------------+---------------+----------------
+ g_alias_lower | g_alias_ident | g_explicit_hdr
+(1 row)
+
+-- 3. Explicit KEY, SOURCE KEY / DESTINATION KEY, DEFAULT LABEL, multiple LABELs,
+--    PROPERTIES ALL COLUMNS EXCEPT, custom PROPERTIES expressions, NO PROPERTIES
+CREATE FUNCTION g_rich() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (
+    t1 KEY (a)
+      DEFAULT LABEL
+      LABEL l_basic PROPERTIES (a, upper(b) AS b_up)
+      LABEL l_extra PROPERTIES (c AS score),
+    t2 AS v_t2 KEY (i)
+      PROPERTIES ALL COLUMNS EXCEPT (j),
+    t3 KEY (x, y)
+      NO PROPERTIES
+  )
+  RELATIONSHIP TABLES (
+    t2 AS e_t2 KEY (i)
+      SOURCE KEY (i) REFERENCES t2 (i)
+      DESTINATION KEY (j) REFERENCES t1 (a)
+      LABEL links_to NO PROPERTIES
+  )
+$$;
+SELECT jsonb_pretty((g_rich())::jsonb -> 'property_types');
+              jsonb_pretty               
+-----------------------------------------
+ {                                      +
+     "a": {                             +
+         "typmod": -1,                  +
+         "type_oid": 23,                +
+         "type_sql": "integer",         +
+         "firstElement": "t1",          +
+         "collation_oid": 0,            +
+         "collation_name": ""           +
+     },                                 +
+     "b": {                             +
+         "typmod": -1,                  +
+         "type_oid": 25,                +
+         "type_sql": "text",            +
+         "firstElement": "t1",          +
+         "collation_oid": 100,          +
+         "collation_name": "default"    +
+     },                                 +
+     "c": {                             +
+         "typmod": -1,                  +
+         "type_oid": 1700,              +
+         "type_sql": "numeric",         +
+         "firstElement": "t1",          +
+         "collation_oid": 0,            +
+         "collation_name": ""           +
+     },                                 +
+     "i": {                             +
+         "typmod": -1,                  +
+         "type_oid": 23,                +
+         "type_sql": "integer",         +
+         "firstElement": "v_t2",        +
+         "collation_oid": 0,            +
+         "collation_name": ""           +
+     },                                 +
+     "k": {                             +
+         "typmod": -1,                  +
+         "type_oid": 25,                +
+         "type_sql": "text",            +
+         "firstElement": "v_t2",        +
+         "collation_oid": 100,          +
+         "collation_name": "default"    +
+     },                                 +
+     "b_up": {                          +
+         "typmod": -1,                  +
+         "type_oid": 25,                +
+         "type_sql": "text",            +
+         "firstElement": "t1",          +
+         "collation_oid": 100,          +
+         "collation_name": "\"default\""+
+     },                                 +
+     "score": {                         +
+         "typmod": -1,                  +
+         "type_oid": 1700,              +
+         "type_sql": "numeric",         +
+         "firstElement": "t1",          +
+         "collation_oid": 0,            +
+         "collation_name": ""           +
+     }                                  +
+ }
+(1 row)
+
+-- 4. Temporary table in property graph marks graph as temporary
+CREATE TEMP TABLE tmp_v (id int PRIMARY KEY, val text);
+CREATE FUNCTION g_temp() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (tmp_v)
+$$;
+SELECT (g_temp())::jsonb ->> 'is_temporary' AS is_temp;
+ is_temp 
+---------
+ true
+(1 row)
+
+-- 5. Negative tests matching PG 19 create_property_graph.sql
+-- 5a. Syntax error: empty graph (no VERTEX TABLES or EDGE TABLES)
+CREATE FUNCTION g_err_empty() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  CREATE PROPERTY GRAPH g_err_empty
+$$;
+ERROR:  syntax error: CREATE PROPERTY GRAPH requires at least VERTEX TABLES (...) or EDGE TABLES (...) at position 0
+CONTEXT:  pgq_compiler_bundle() LINE 967:       throw PgqLexer.createSyntaxError(
+-- 5b. Unlogged table in persistent property graph
+CREATE UNLOGGED TABLE unlogged_v (id int PRIMARY KEY);
+CREATE FUNCTION g_err_unlogged() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (unlogged_v)
+$$;
+ERROR:  cannot use unlogged table "unlogged_v" in a persistent property graph
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- Allowed when CREATE TEMPORARY PROPERTY GRAPH is specified
+CREATE FUNCTION g_ok_temp_unlogged() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  CREATE TEMP PROPERTY GRAPH g_ok_temp_unlogged
+  VERTEX TABLES (unlogged_v)
+$$;
+SELECT (g_ok_temp_unlogged())::jsonb ->> 'is_temporary' AS is_temp_unlogged;
+ is_temp_unlogged 
+------------------
+ true
+(1 row)
+
+-- 5c. Missing primary key without KEY clause
+CREATE TABLE no_pk_v (a int, b text);
+CREATE FUNCTION g_err_no_pk() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (no_pk_v)
+$$;
+ERROR:  KEY clause is required for element table "no_pk_v" because relation "no_pk_v" has no primary key
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5d. Duplicate element table alias
+CREATE FUNCTION g_err_dup_alias() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (t1, t2 AS t1)
+$$;
+ERROR:  duplicate element table alias "t1" in property graph
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5e. Duplicate label on same element table
+CREATE FUNCTION g_err_dup_label() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (
+    t1 LABEL l1 PROPERTIES (a) LABEL l1 PROPERTIES (a)
+  )
+$$;
+ERROR:  label "l1" specified more than once for element table "t1"
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5f. Non-existent EXCEPT column
+CREATE FUNCTION g_err_bad_except() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (
+    t1 PROPERTIES ALL COLUMNS EXCEPT (nonexistent_col)
+  )
+$$;
+ERROR:  column "nonexistent_col" in EXCEPT list does not exist in relation "t1"
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5g. Duplicate property name within same label
+CREATE FUNCTION g_err_dup_prop() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (
+    t1 LABEL l1 PROPERTIES (a, b AS a)
+  )
+$$;
+ERROR:  property "a" specified more than once for label "l1"
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5h. Complex property expression without AS alias
+CREATE FUNCTION g_err_no_alias() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (
+    t1 LABEL l1 PROPERTIES (a + 1)
+  )
+$$;
+ERROR:  syntax error: property expression "a + 1" requires an AS alias at position 47
+CONTEXT:  pgq_compiler_bundle() LINE 665:             throw PgqLexer.createSyntaxError(
+-- 5i. Same label on same element table (via DEFAULT LABEL + explicit LABEL) with different property counts
+CREATE FUNCTION g_err_same_lbl_count() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (
+    t1 DEFAULT LABEL PROPERTIES (a) LABEL t1 PROPERTIES (a, b)
+  )
+$$;
+ERROR:  label "t1" specified more than once for element table "t1"
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5j. Same element table defines same property with different expressions across two labels
+CREATE FUNCTION g_err_diff_expr() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (
+    t1 LABEL l1 PROPERTIES (a AS p1) LABEL l2 PROPERTIES (a + 1 AS p1)
+  )
+$$;
+ERROR:  property "p1" on element table "t1" has mismatching expressions across labels
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5k. Property data type mismatch across labels in graph
+CREATE FUNCTION g_err_prop_type() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (
+    t1 LABEL l1 PROPERTIES (a AS common_prop),
+    t2 LABEL l2 PROPERTIES (k AS common_prop)
+  )
+$$;
+ERROR:  property "common_prop" has mismatching data types (integer vs text)
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5l. Property typmod mismatch across labels in graph
+CREATE TABLE tv_char1 (id int PRIMARY KEY, code varchar(5));
+CREATE TABLE tv_char2 (id int PRIMARY KEY, code varchar(10));
+CREATE FUNCTION g_err_prop_typmod() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (tv_char1, tv_char2)
+$$;
+ERROR:  property "code" has mismatching type modifiers (character varying(5) vs character varying(10))
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5m. Property collation mismatch across labels in graph
+CREATE TABLE tv_coll1 (id int PRIMARY KEY, name text COLLATE "C");
+CREATE TABLE tv_coll2 (id int PRIMARY KEY, name text COLLATE "POSIX");
+CREATE FUNCTION g_err_prop_coll() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (tv_coll1, tv_coll2)
+$$;
+ERROR:  property "name" has mismatching collations across element tables
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5n. Missing foreign key between edge and vertex table
+CREATE FUNCTION g_err_no_fk() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (t1, t3)
+  EDGE TABLES (t2 SOURCE t1 DESTINATION t3)
+$$;
+ERROR:  no foreign key found between edge table "t2" and vertex table "t3"
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5o. Ambiguous multiple foreign keys between edge and vertex table
+CREATE TABLE multi_fk_e (
+  id int PRIMARY KEY,
+  s1 int REFERENCES t1(a),
+  s2 int REFERENCES t1(a)
+);
+CREATE FUNCTION g_err_multi_fk() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (t1)
+  EDGE TABLES (multi_fk_e SOURCE t1 DESTINATION t1)
+$$;
+ERROR:  more than one foreign key found between edge table "multi_fk_e" and vertex table "t1"; specify SOURCE KEY (...) explicitly
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5p. Key column count mismatch in REFERENCES
+CREATE FUNCTION g_err_fk_count() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (t1, t3)
+  EDGE TABLES (
+    t4 SOURCE KEY (t1_a) REFERENCES t3 (x, y)
+       DESTINATION KEY (t1_a) REFERENCES t1 (a)
+  )
+$$;
+ERROR:  number of source/destination key columns (1) does not match number of referenced vertex key columns (2)
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5q. Key column type mismatch in REFERENCES
+CREATE FUNCTION g_err_fk_type() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (t1, t2)
+  EDGE TABLES (
+    t2 AS e_t2 SOURCE KEY (k) REFERENCES t1 (a)
+       DESTINATION KEY (i) REFERENCES t2 (i)
+  )
+$$;
+ERROR:  foreign key column "k" (text) and referenced column "a" (integer) are of incompatible types
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+-- 5r. Aggregate function in property expression
+CREATE FUNCTION g_err_agg_prop() RETURNS "PROPERTY GRAPH"
+LANGUAGE "CREATE PROPERTY GRAPH" AS $$
+  VERTEX TABLES (
+    t1 PROPERTIES (count(a) AS cnt)
+  )
+$$;
+ERROR:  invalid property expression "count(a)" on relation "t1": aggregate functions are not allowed in FROM clause of their own query level
+CONTEXT:  pgq_compiler_bundle() LINE 1003:     throw err;
+DROP SCHEMA pgq_ddl_test CASCADE;
+NOTICE:  drop cascades to 18 other objects
+DETAIL:  drop cascades to table t1
+drop cascades to table t2
+drop cascades to table t3
+drop cascades to table t4
+drop cascades to function g_minimal()
+drop cascades to function g_alias_lower()
+drop cascades to function g_alias_ident()
+drop cascades to function g_alias_v8()
+drop cascades to function g_rich()
+drop cascades to function g_temp()
+drop cascades to table unlogged_v
+drop cascades to function g_ok_temp_unlogged()
+drop cascades to table no_pk_v
+drop cascades to table tv_char1
+drop cascades to table tv_char2
+drop cascades to table tv_coll1
+drop cascades to table tv_coll2
+drop cascades to table multi_fk_e

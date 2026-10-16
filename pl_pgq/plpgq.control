@@ -1,0 +1,5 @@
+# ISO/IEC 9075-16 SQL/PGQ Property Graph DDL & GRAPH_TABLE compiler on V8 (pl_pgq / plpgq)
+comment = 'ISO/IEC 9075-16 SQL/PGQ Property Graph DDL & GRAPH_TABLE compiler on V8 (pl_pgq / plpgq)'
+default_version = '1.0'
+relocatable = false
+trusted = true
