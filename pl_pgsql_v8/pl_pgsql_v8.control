@@ -1,0 +1,5 @@
+# PL/pgSQL compiled to JavaScript on V8 (pl_pgsql_v8 / plpgsql_v8 / pl/pgsql+v8)
+comment = 'PL/pgSQL compiled to JavaScript on V8 (pl_pgsql_v8 / plpgsql_v8 / pl/pgsql+v8)'
+default_version = '1.0'
+relocatable = false
+trusted = true

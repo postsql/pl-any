@@ -1,0 +1,1197 @@
+CREATE EXTENSION IF NOT EXISTS plv8;
+CREATE EXTENSION IF NOT EXISTS pl_pgsql_v8;
+-- ============================================================================
+-- 1. Verify C++ fixes:
+--    (a) Cursor subtransaction handling (SPI stays connected after cursor error)
+--    (b) JS error sqlerrcode/detail/hint/constraint preservation across subtransaction
+--    (c) PassUserTypesScope opt-in (composite/domain/enum types passed as JS values)
+-- ============================================================================
+-- 1a. Cursor fetch error inside try/catch does not disconnect SPI
+CREATE FUNCTION test_cursor_subtran_recovery() RETURNS text AS $$
+  var plan = plv8.prepare("SELECT 10 / x AS val FROM (VALUES (2), (0), (5)) AS t(x)");
+  var cur = plan.cursor();
+  var first = cur.fetch();
+  var caught = null;
+  try {
+    cur.fetch();
+  } catch (e) {
+    caught = e.sqlerrcode + ":" + e.message;
+  }
+  // SPI must still be connected after the cursor error!
+  var after = plv8.execute("SELECT 'spi_alive' AS status")[0].status;
+  plan.free();
+  return first.val + " | " + caught + " | " + after;
+$$ LANGUAGE plv8;
+SELECT test_cursor_subtran_recovery();
+      test_cursor_subtran_recovery      
+----------------------------------------
+ 5 | 22012:division by zero | spi_alive
+(1 row)
+
+DROP FUNCTION test_cursor_subtran_recovery();
+-- 1b. Custom JS error properties (sqlerrcode, detail, hint, constraint_name, etc.)
+-- preserved across plv8.subtransaction() and reported by js_error::rethrow()
+CREATE FUNCTION test_subtran_error_props() RETURNS jsonb AS $$
+  try {
+    plv8.subtransaction(function() {
+      var err = new Error("custom failure");
+      err.sqlerrcode = "23505";
+      err.detail = "Key (id)=(42) already exists.";
+      err.hint = "Use ON CONFLICT DO NOTHING.";
+      err.schema_name = "public";
+      err.table_name = "items";
+      err.column_name = "id";
+      err.datatype_name = "int4";
+      err.constraint_name = "items_pkey";
+      throw err;
+    });
+  } catch (e) {
+    return {
+      message: e.message,
+      sqlerrcode: e.sqlerrcode,
+      detail: e.detail,
+      hint: e.hint,
+      schema_name: e.schema_name,
+      table_name: e.table_name,
+      column_name: e.column_name,
+      datatype_name: e.datatype_name,
+      constraint_name: e.constraint_name
+    };
+  }
+$$ LANGUAGE plv8;
+SELECT jsonb_pretty(test_subtran_error_props());
+                  jsonb_pretty                  
+------------------------------------------------
+ {                                             +
+     "hint": "Use ON CONFLICT DO NOTHING.",    +
+     "detail": "Key (id)=(42) already exists.",+
+     "message": "custom failure",              +
+     "sqlerrcode": "23505",                    +
+     "table_name": "items",                    +
+     "column_name": "id",                      +
+     "schema_name": "public",                  +
+     "datatype_name": "int4",                  +
+     "constraint_name": "items_pkey"           +
+ }
+(1 row)
+
+DROP FUNCTION test_subtran_error_props();
+-- 1c. Composite and domain types work normally with custom language handlers
+CREATE TYPE plpgsql_v8_pair AS (a int, b text);
+CREATE DOMAIN plpgsql_v8_posint AS int CHECK (VALUE > 0);
+CREATE FUNCTION make_pair_v8(x plpgsql_v8_posint, y text) RETURNS plpgsql_v8_pair AS $$
+DECLARE
+  res plpgsql_v8_pair;
+BEGIN
+  res.a := x * 2;
+  res.b := upper(y);
+  RETURN res;
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT * FROM make_pair_v8(21, 'hello');
+ a  |   b   
+----+-------
+ 42 | HELLO
+(1 row)
+
+CREATE FUNCTION sum_pair_v8(p plpgsql_v8_pair) RETURNS text AS $$
+BEGIN
+  RETURN p.b || ':' || (p.a + 10);
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT sum_pair_v8(ROW(5, 'item')::plpgsql_v8_pair);
+ sum_pair_v8 
+-------------
+ item:15
+(1 row)
+
+-- ============================================================================
+-- 2. Basic Declarations, Parameters ($1, named, ALIAS, CONSTANT, NOT NULL),
+--    Shadowing, Qualified Labels, and Expressions
+-- ============================================================================
+CREATE FUNCTION test_decl_and_expr(a int, b int DEFAULT 10) RETURNS int AS $$
+<<main_blk>>
+DECLARE
+  v_alias ALIAS FOR $1;
+  c_mult CONSTANT int := 3;
+  v_nn int NOT NULL := 5;
+  v_shadow int := 100;
+BEGIN
+  v_alias := v_alias + b;
+  <<inner_blk>>
+  DECLARE
+    v_shadow int := 7;
+  BEGIN
+    main_blk.v_shadow := main_blk.v_shadow + inner_blk.v_shadow + (v_alias * c_mult) + v_nn;
+  END inner_blk;
+  RETURN v_shadow;
+END main_blk;
+$$ LANGUAGE plpgsql_v8;
+SELECT test_decl_and_expr(4, 6);
+ test_decl_and_expr 
+--------------------
+                142
+(1 row)
+
+-- Integer vs Floating-point division and SQL three-valued logic with NULLs
+CREATE FUNCTION test_math_and_3vl(x int, y int) RETURNS jsonb AS $$
+DECLARE
+  int_div int;
+  flt_div numeric;
+  null_arith int;
+  null_concat text;
+  t_and_null bool;
+  f_and_null bool;
+  t_or_null bool;
+  f_or_null bool;
+  not_null_v bool;
+  in_with_null bool;
+  not_in_with_null bool;
+  dist1 bool;
+  dist2 bool;
+BEGIN
+  int_div := x / y;
+  flt_div := (x * 1.0) / y;
+  null_arith := x + NULL;
+  null_concat := 'abc' || NULL;
+  t_and_null := TRUE AND NULL;
+  f_and_null := FALSE AND NULL;
+  t_or_null := TRUE OR NULL;
+  f_or_null := FALSE OR NULL;
+  not_null_v := NOT (NULL::bool);
+  in_with_null := 2 IN (1, 2, NULL);
+  not_in_with_null := 3 NOT IN (1, 2, NULL);
+  dist1 := (NULL IS DISTINCT FROM NULL);
+  dist2 := (1 IS DISTINCT FROM NULL);
+
+  RETURN jsonb_build_object(
+    'int_div', int_div,
+    'flt_div', flt_div,
+    'null_arith', null_arith,
+    'null_concat', null_concat,
+    't_and_null', t_and_null,
+    'f_and_null', f_and_null,
+    't_or_null', t_or_null,
+    'f_or_null', f_or_null,
+    'not_null_v', not_null_v,
+    'in_with_null', in_with_null,
+    'not_in_with_null', not_in_with_null,
+    'dist1', dist1,
+    'dist2', dist2
+  );
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT jsonb_pretty(test_math_and_3vl(7, 2));
+         jsonb_pretty         
+------------------------------
+ {                           +
+     "dist1": false,         +
+     "dist2": true,          +
+     "flt_div": 3.5,         +
+     "int_div": 3,           +
+     "f_or_null": null,      +
+     "t_or_null": true,      +
+     "f_and_null": false,    +
+     "not_null_v": null,     +
+     "null_arith": null,     +
+     "t_and_null": null,     +
+     "null_concat": null,    +
+     "in_with_null": true,   +
+     "not_in_with_null": null+
+ }
+(1 row)
+
+-- String operators (LIKE, ILIKE, BETWEEN, CASE expression, COALESCE, NULLIF, GREATEST, LEAST)
+CREATE FUNCTION test_expr_features(s text, n int) RETURNS text AS $$
+DECLARE
+  cat text;
+  like_ok bool;
+  ilike_ok bool;
+  btw_ok bool;
+  coal text;
+  nif int;
+  gr int;
+  ls int;
+BEGIN
+  cat := CASE
+    WHEN n < 0 THEN 'negative'
+    WHEN n = 0 THEN 'zero'
+    ELSE 'positive'
+  END;
+  like_ok := s LIKE 'he%o';
+  ilike_ok := s ILIKE 'HE_LO';
+  btw_ok := n BETWEEN 1 AND 10;
+  coal := COALESCE(NULL, NULL, upper(s), 'fallback');
+  nif := NULLIF(n, 5);
+  gr := GREATEST(1, n, 3);
+  ls := LEAST(10, n, 3);
+  RETURN format('%s|%s|%s|%s|%s|%s|%s|%s', cat, like_ok, ilike_ok, btw_ok, coal, COALESCE(nif::text, 'NULL'), gr, ls);
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT test_expr_features('hello', 5);
+      test_expr_features       
+-------------------------------
+ positive|t|t|t|HELLO|NULL|5|3
+(1 row)
+
+SELECT test_expr_features('hello', -2);
+      test_expr_features      
+------------------------------
+ negative|t|t|f|HELLO|-2|3|-2
+(1 row)
+
+-- ============================================================================
+-- 3. Control Flow: IF/ELSIF/ELSE, CASE Statement, LOOP, WHILE, FOR, FOREACH
+-- ============================================================================
+CREATE FUNCTION test_control_flow(mode int) RETURNS text AS $$
+DECLARE
+  res text := '';
+  i int := 0;
+  arr int[] := ARRAY[10, 20, 30, 40];
+  slice_arr int[] := ARRAY[[1, 2], [3, 4], [5, 6]];
+  sub int[];
+  x int;
+BEGIN
+  -- IF / ELSIF / ELSE
+  IF mode < 0 THEN
+    res := 'neg:';
+  ELSIF mode = 0 THEN
+    res := 'zero:';
+  ELSE
+    res := 'pos:';
+  END IF;
+
+  -- Searched and simple CASE statement
+  CASE mode
+    WHEN -1 THEN res := res || 'minus_one|';
+    WHEN 0, 1 THEN res := res || 'zero_or_one|';
+    ELSE res := res || 'other|';
+  END CASE;
+
+  -- WHILE loop with CONTINUE WHEN and EXIT WHEN
+  WHILE i < 6 LOOP
+    i := i + 1;
+    CONTINUE WHEN i % 2 = 0;
+    EXIT WHEN i > 5;
+    res := res || i || ',';
+  END LOOP;
+
+  res := res || '|rev:';
+  -- Integer FOR IN REVERSE .. BY
+  FOR k IN REVERSE 6 .. 1 BY 2 LOOP
+    res := res || k || ',';
+  END LOOP;
+
+  -- Array element manipulation (1-indexed) and FOREACH
+  arr[2] := 25;
+  arr[5] := 50;
+  res := res || '|arr(' || array_length(arr, 1) || '):';
+  FOREACH x IN ARRAY arr LOOP
+    res := res || x || ',';
+  END LOOP;
+
+  -- FOREACH SLICE 1
+  res := res || '|slice:';
+  FOREACH sub SLICE 1 IN ARRAY slice_arr LOOP
+    res := res || '(' || sub[1] || '+' || sub[2] || '),';
+  END LOOP;
+
+  RETURN res;
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT test_control_flow(1);
+                                 test_control_flow                                 
+-----------------------------------------------------------------------------------
+ pos:zero_or_one|1,3,5,|rev:6,4,2,|arr(5):10,25,30,40,50,|slice:(1+2),(3+4),(5+6),
+(1 row)
+
+-- CASE statement without ELSE raises case_not_found (20000), caught by EXCEPTION
+CREATE FUNCTION test_case_not_found(v int) RETURNS text AS $$
+BEGIN
+  CASE v
+    WHEN 1 THEN RETURN 'one';
+    WHEN 2 THEN RETURN 'two';
+  END CASE;
+EXCEPTION
+  WHEN case_not_found THEN
+    RETURN 'caught case_not_found (' || SQLSTATE || ')';
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT test_case_not_found(1);
+ test_case_not_found 
+---------------------
+ one
+(1 row)
+
+SELECT test_case_not_found(99);
+      test_case_not_found      
+-------------------------------
+ caught case_not_found (20000)
+(1 row)
+
+-- ============================================================================
+-- 4. Static & Dynamic SQL, SELECT INTO [STRICT], PERFORM, GET DIAGNOSTICS,
+--    %TYPE, %ROWTYPE, RECORD, and Column/Variable Name Disambiguation
+-- ============================================================================
+CREATE TABLE plpgsql_v8_items (
+  id int PRIMARY KEY,
+  name text NOT NULL,
+  qty int NOT NULL
+);
+CREATE FUNCTION test_sql_operations() RETURNS jsonb AS $$
+DECLARE
+  id int := 1;
+  name text := 'alpha';
+  qty int := 10;
+  v_row plpgsql_v8_items%ROWTYPE;
+  v_rec RECORD;
+  v_name plpgsql_v8_items.name%TYPE;
+  v_qty int;
+  row_cnt int;
+  found_empty bool;
+  strict_no_data text := 'not_caught';
+  strict_too_many text := 'not_caught';
+  dyn_sum int := 0;
+BEGIN
+  -- Variable names (id, name, qty) intentionally match column names (id, name, qty)!
+  INSERT INTO plpgsql_v8_items (id, name, qty) VALUES (id, name, qty);
+  INSERT INTO plpgsql_v8_items (id, name, qty) VALUES (2, 'beta', 20);
+  INSERT INTO plpgsql_v8_items (id, name, qty) VALUES (3, 'gamma', 30);
+
+  -- UPDATE where column name matches variable name
+  UPDATE plpgsql_v8_items SET qty = qty + 5 WHERE plpgsql_v8_items.id = id;
+  GET DIAGNOSTICS row_cnt = ROW_COUNT;
+
+  -- PERFORM
+  PERFORM 1 FROM plpgsql_v8_items WHERE plpgsql_v8_items.id = 1;
+
+  -- SELECT INTO %ROWTYPE
+  SELECT * INTO STRICT v_row FROM plpgsql_v8_items WHERE plpgsql_v8_items.id = 1;
+
+  -- SELECT INTO multiple scalar variables
+  SELECT plpgsql_v8_items.name, plpgsql_v8_items.qty
+    INTO STRICT v_name, v_qty
+    FROM plpgsql_v8_items
+    WHERE plpgsql_v8_items.id = 2;
+
+  -- Non-strict SELECT INTO with 0 rows sets target to NULL and FOUND to false
+  SELECT plpgsql_v8_items.name INTO v_name FROM plpgsql_v8_items WHERE plpgsql_v8_items.id = 999;
+  found_empty := FOUND;
+
+  -- STRICT with 0 rows raises no_data_found (P0002)
+  BEGIN
+    SELECT * INTO STRICT v_rec FROM plpgsql_v8_items WHERE plpgsql_v8_items.id = 999;
+  EXCEPTION
+    WHEN no_data_found THEN
+      strict_no_data := SQLSTATE || ':' || SQLERRM;
+  END;
+
+  -- STRICT with >1 rows raises too_many_rows (P0003)
+  BEGIN
+    SELECT * INTO STRICT v_rec FROM plpgsql_v8_items;
+  EXCEPTION
+    WHEN too_many_rows THEN
+      strict_too_many := SQLSTATE || ':' || SQLERRM;
+  END;
+
+  -- Dynamic EXECUTE ... INTO STRICT ... USING and FOR ... IN EXECUTE ... USING
+  EXECUTE 'UPDATE plpgsql_v8_items SET qty = qty + $1 WHERE id = $2 RETURNING name, qty'
+    INTO STRICT v_rec
+    USING 100, 3;
+
+  FOR v_row IN EXECUTE 'SELECT * FROM plpgsql_v8_items WHERE qty >= $1 ORDER BY id' USING 15 LOOP
+    dyn_sum := dyn_sum + v_row.qty;
+  END LOOP;
+
+  RETURN jsonb_build_object(
+    'update_row_cnt', row_cnt,
+    'row1_qty', v_row.qty,
+    'row2_qty', v_qty,
+    'v_name_after_empty', v_name,
+    'found_empty', found_empty,
+    'strict_no_data', strict_no_data,
+    'strict_too_many', strict_too_many,
+    'exec_returning_name', v_rec.name,
+    'exec_returning_qty', v_rec.qty,
+    'dyn_sum', dyn_sum
+  );
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT jsonb_pretty(test_sql_operations());
+                           jsonb_pretty                           
+------------------------------------------------------------------
+ {                                                               +
+     "dyn_sum": 165,                                             +
+     "row1_qty": 130,                                            +
+     "row2_qty": 20,                                             +
+     "found_empty": false,                                       +
+     "strict_no_data": "P0002:query returned no rows",           +
+     "update_row_cnt": 1,                                        +
+     "strict_too_many": "P0003:query returned more than one row",+
+     "exec_returning_qty": "130",                                +
+     "v_name_after_empty": null,                                 +
+     "exec_returning_name": "gamma"                              +
+ }
+(1 row)
+
+-- ============================================================================
+-- 5. Subtransaction Rollback Semantics, RETURN inside EXCEPTION block,
+--    GET STACKED DIAGNOSTICS, RAISE, and ASSERT
+-- ============================================================================
+CREATE FUNCTION test_subtran_rollback_and_return() RETURNS jsonb AS $$
+DECLARE
+  v_sqlstate text;
+  v_msg text;
+  v_detail text;
+  v_hint text;
+  v_constraint text;
+  v_cnt int;
+BEGIN
+  -- Insert row 10 outside subtransaction (must survive!)
+  INSERT INTO plpgsql_v8_items VALUES (10, 'outer_ok', 100);
+
+  BEGIN
+    -- Insert row 11 inside subtransaction, then trigger unique_violation on id=1
+    INSERT INTO plpgsql_v8_items VALUES (11, 'rolled_back', 200);
+    INSERT INTO plpgsql_v8_items VALUES (1, 'dup_key', 999);
+  EXCEPTION
+    WHEN unique_violation THEN
+      GET STACKED DIAGNOSTICS
+        v_sqlstate = RETURNED_SQLSTATE,
+        v_msg = MESSAGE_TEXT;
+      INSERT INTO plpgsql_v8_items VALUES (12, 'recovered_in_handler', 300);
+  END;
+
+  -- Subtransaction that succeeds and executes RETURN from inside the BEGIN..EXCEPTION block:
+  -- database work inside the block (id=13) MUST be committed, not rolled back!
+  BEGIN
+    INSERT INTO plpgsql_v8_items VALUES (13, 'committed_before_return', 400);
+    SELECT count(*) INTO v_cnt FROM plpgsql_v8_items WHERE id IN (10, 11, 12, 13);
+    RETURN jsonb_build_object(
+      'caught_sqlstate', v_sqlstate,
+      'has_dup_msg', (v_msg LIKE '%unique constraint%'),
+      'surviving_count', v_cnt,
+      'id_11_exists', EXISTS (SELECT 1 FROM plpgsql_v8_items WHERE id = 11),
+      'id_13_exists', EXISTS (SELECT 1 FROM plpgsql_v8_items WHERE id = 13)
+    );
+  EXCEPTION
+    WHEN OTHERS THEN
+      RETURN jsonb_build_object('error', SQLERRM);
+  END;
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT jsonb_pretty(test_subtran_rollback_and_return());
+          jsonb_pretty           
+---------------------------------
+ {                              +
+     "has_dup_msg": true,       +
+     "id_11_exists": false,     +
+     "id_13_exists": true,      +
+     "caught_sqlstate": "23505",+
+     "surviving_count": 3       +
+ }
+(1 row)
+
+-- Verify id=13 persisted after the function returned from inside the subtransaction
+SELECT id, name, qty FROM plpgsql_v8_items WHERE id >= 10 ORDER BY id;
+ id |          name           | qty 
+----+-------------------------+-----
+ 10 | outer_ok                | 100
+ 12 | recovered_in_handler    | 300
+ 13 | committed_before_return | 400
+(3 rows)
+
+-- Test RAISE USING options + bare RAISE rethrow + ASSERT failure catching
+CREATE FUNCTION test_raise_and_assert(do_assert bool) RETURNS jsonb AS $$
+DECLARE
+  v_state text;
+  v_msg text;
+  v_detail text;
+  v_hint text;
+  v_table text;
+  v_constraint text;
+BEGIN
+  IF do_assert THEN
+    BEGIN
+      ASSERT 1 = 2, 'custom assertion message';
+    EXCEPTION
+      WHEN assert_failure THEN
+        RETURN jsonb_build_object(
+          'kind', 'assert',
+          'sqlstate', SQLSTATE,
+          'sqlerrm', SQLERRM
+        );
+    END;
+  END IF;
+
+  BEGIN
+    BEGIN
+      RAISE NOTICE 'starting raise test with % and %% and %', 'arg1', NULL;
+      RAISE EXCEPTION USING
+        ERRCODE = 'unique_violation',
+        MESSAGE = 'custom unique error',
+        DETAIL = 'Key (k)=(v) duplicated',
+        HINT = 'Check input values',
+        TABLE = 'plpgsql_v8_items',
+        CONSTRAINT = 'custom_uk';
+    EXCEPTION
+      WHEN integrity_constraint_violation THEN
+        -- Rethrow with bare RAISE; to outer handler
+        RAISE;
+    END;
+  EXCEPTION
+    WHEN unique_violation THEN
+      GET STACKED DIAGNOSTICS
+        v_state = RETURNED_SQLSTATE,
+        v_msg = MESSAGE_TEXT,
+        v_detail = PG_EXCEPTION_DETAIL,
+        v_hint = PG_EXCEPTION_HINT,
+        v_table = TABLE_NAME,
+        v_constraint = CONSTRAINT_NAME;
+      RETURN jsonb_build_object(
+        'kind', 'raise',
+        'sqlstate', v_state,
+        'message', v_msg,
+        'detail', v_detail,
+        'hint', v_hint,
+        'table', v_table,
+        'constraint', v_constraint
+      );
+  END;
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT jsonb_pretty(test_raise_and_assert(true));
+                jsonb_pretty                
+--------------------------------------------
+ {                                         +
+     "kind": "assert",                     +
+     "sqlerrm": "custom assertion message",+
+     "sqlstate": "P0004"                   +
+ }
+(1 row)
+
+SELECT jsonb_pretty(test_raise_and_assert(false));
+NOTICE:  starting raise test with arg1 and % and <NULL>
+              jsonb_pretty               
+-----------------------------------------
+ {                                      +
+     "hint": "Check input values",      +
+     "kind": "raise",                   +
+     "table": "plpgsql_v8_items",       +
+     "detail": "Key (k)=(v) duplicated",+
+     "message": "custom unique error",  +
+     "sqlstate": "23505",               +
+     "constraint": "custom_uk"          +
+ }
+(1 row)
+
+-- ============================================================================
+-- 6. OUT / INOUT Parameters, Set-Returning Functions (RETURN NEXT, RETURN QUERY,
+--    RETURNS TABLE), and Procedures
+-- ============================================================================
+CREATE FUNCTION test_out_params(a int, INOUT b int, OUT sum_val int, OUT prod_val int) AS $$
+BEGIN
+  b := b + 10;
+  sum_val := a + b;
+  prod_val := a * b;
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT * FROM test_out_params(5, 3);
+ b  | sum_val | prod_val 
+----+---------+----------
+ 13 |      18 |       65
+(1 row)
+
+CREATE FUNCTION test_srf_scalar(n int) RETURNS SETOF int AS $$
+BEGIN
+  FOR i IN 1 .. n LOOP
+    RETURN NEXT i * 10;
+  END LOOP;
+  RETURN QUERY SELECT id * 100 FROM plpgsql_v8_items WHERE id <= 2 ORDER BY id;
+  RETURN;
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT * FROM test_srf_scalar(3);
+ test_srf_scalar 
+-----------------
+              10
+              20
+              30
+             100
+             200
+(5 rows)
+
+CREATE FUNCTION test_returns_table(min_id int) RETURNS TABLE(item_id int, item_label text) AS $$
+DECLARE
+  rc int;
+BEGIN
+  item_id := 0;
+  item_label := 'header';
+  RETURN NEXT;
+  RETURN QUERY EXECUTE 'SELECT id, upper(name) FROM plpgsql_v8_items WHERE id <= $1 ORDER BY id' USING min_id;
+  GET DIAGNOSTICS rc = ROW_COUNT;
+  IF FOUND THEN
+    item_id := rc;
+    item_label := 'footer_count';
+    RETURN NEXT;
+  END IF;
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT * FROM test_returns_table(3);
+ item_id |  item_label  
+---------+--------------
+       0 | header
+       1 | ALPHA
+       2 | BETA
+       3 | GAMMA
+       3 | footer_count
+(5 rows)
+
+CREATE PROCEDURE test_proc_v8(v_id int, v_name text, INOUT v_total int) AS $$
+BEGIN
+  INSERT INTO plpgsql_v8_items VALUES (v_id, v_name, 50);
+  SELECT sum(qty) INTO v_total FROM plpgsql_v8_items WHERE id <= 3 OR id = v_id;
+END;
+$$ LANGUAGE plpgsql_v8;
+CALL test_proc_v8(20, 'from_proc', 0);
+ v_total 
+---------
+     215
+(1 row)
+
+-- ============================================================================
+-- 7. Cursors: Bound Cursors (with args), Unbound REFCURSOR, FETCH, MOVE, CLOSE,
+--    and FOR rec IN bound_cursor(arg) LOOP
+-- ============================================================================
+CREATE FUNCTION test_cursors_v8() RETURNS jsonb AS $$
+DECLARE
+  c_bound CURSOR (max_id int) FOR SELECT id, name FROM plpgsql_v8_items WHERE id <= max_id ORDER BY id;
+  c_ref refcursor;
+  v_id int;
+  v_name text;
+  r RECORD;
+  fetched_names text[] := ARRAY[]::text[];
+  loop_names text[] := ARRAY[]::text[];
+BEGIN
+  OPEN c_bound(3);
+  FETCH NEXT FROM c_bound INTO v_id, v_name;
+  fetched_names := fetched_names || (v_id || ':' || v_name);
+  MOVE NEXT FROM c_bound;
+  FETCH NEXT FROM c_bound INTO v_id, v_name;
+  fetched_names := fetched_names || (v_id || ':' || v_name);
+  CLOSE c_bound;
+
+  -- Cursor FOR loop automatically opens, fetches, and closes c_bound
+  FOR r IN c_bound(2) LOOP
+    loop_names := loop_names || r.name;
+  END LOOP;
+
+  -- Unbound refcursor with OPEN ... FOR EXECUTE ... USING
+  OPEN c_ref FOR EXECUTE 'SELECT id, name FROM plpgsql_v8_items WHERE id = $1' USING 20;
+  FETCH c_ref INTO v_id, v_name;
+  CLOSE c_ref;
+
+  RETURN jsonb_build_object(
+    'fetched_names', fetched_names,
+    'loop_names', loop_names,
+    'ref_item', v_id || ':' || v_name
+  );
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT jsonb_pretty(test_cursors_v8());
+          jsonb_pretty           
+---------------------------------
+ {                              +
+     "ref_item": "20:from_proc",+
+     "loop_names": [            +
+         "alpha",               +
+         "beta"                 +
+     ],                         +
+     "fetched_names": [         +
+         "1:alpha",             +
+         "3:gamma"              +
+     ]                          +
+ }
+(1 row)
+
+-- ============================================================================
+-- 8. Triggers (NEW, OLD, TG_OP, TG_NAME, TG_TABLE_NAME, 0-based TG_ARGV) and DO blocks
+-- ============================================================================
+CREATE TABLE plpgsql_v8_audit (
+  op text,
+  tbl text,
+  arg0 text,
+  detail text
+);
+CREATE FUNCTION plpgsql_v8_trig_fn() RETURNS trigger AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    NEW.name := TG_ARGV[0] || '_' || NEW.name;
+    INSERT INTO plpgsql_v8_audit VALUES (TG_OP, TG_TABLE_NAME, TG_ARGV[0], NEW.name || ':' || NEW.qty);
+    RETURN NEW;
+  ELSIF TG_OP = 'UPDATE' THEN
+    IF NEW.qty < 0 THEN
+      RETURN NULL; -- skip update if negative qty
+    END IF;
+    INSERT INTO plpgsql_v8_audit VALUES (TG_OP, TG_TABLE_NAME, TG_ARGV[0], OLD.qty || '->' || NEW.qty);
+    RETURN NEW;
+  ELSIF TG_OP = 'DELETE' THEN
+    INSERT INTO plpgsql_v8_audit VALUES (TG_OP, TG_TABLE_NAME, TG_ARGV[0], OLD.name);
+    RETURN OLD;
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql_v8;
+CREATE TRIGGER tr_plpgsql_v8
+  BEFORE INSERT OR UPDATE OR DELETE ON plpgsql_v8_items
+  FOR EACH ROW EXECUTE FUNCTION plpgsql_v8_trig_fn('pfx');
+INSERT INTO plpgsql_v8_items VALUES (30, 'trigitem', 77);
+UPDATE plpgsql_v8_items SET qty = -5 WHERE id = 30; -- skipped by trigger returning NULL
+UPDATE plpgsql_v8_items SET qty = 88 WHERE id = 30;
+DELETE FROM plpgsql_v8_items WHERE id = 30;
+SELECT * FROM plpgsql_v8_audit ORDER BY op;
+   op   |       tbl        | arg0 |     detail      
+--------+------------------+------+-----------------
+ DELETE | plpgsql_v8_items | pfx  | pfx_trigitem
+ INSERT | plpgsql_v8_items | pfx  | pfx_trigitem:77
+ UPDATE | plpgsql_v8_items | pfx  | 77->88
+(3 rows)
+
+-- Inline DO block in LANGUAGE plpgsql_v8
+DO $$
+DECLARE
+  cnt int;
+BEGIN
+  SELECT count(*) INTO cnt FROM plpgsql_v8_audit;
+  RAISE NOTICE 'audit count from DO block = %', cnt;
+END;
+$$ LANGUAGE plpgsql_v8;
+NOTICE:  audit count from DO block = 3
+-- Direct inspection of transpiled JS via plv8.compile_plpgsql()
+SELECT plv8.compile_plpgsql('BEGIN RETURN 1 + 2; END;') LIKE '%__rt.add(1, 2)%' AS has_fast_path_add;
+ has_fast_path_add 
+-------------------
+ t
+(1 row)
+
+SELECT plv8.compile_plpgsql('BEGIN RETURN QUERY SELECT 1; END;') LIKE '%__rt.returnQuery(%' AS has_direct_return_query;
+ has_direct_return_query 
+-------------------------
+ t
+(1 row)
+
+-- ============================================================================
+-- 9. Negative Tests & Unprivileged Role Security Verification
+-- ============================================================================
+\set VERBOSITY terse
+-- Constant variable assignment rejected at compile time
+CREATE FUNCTION bad_const_assign() RETURNS int AS $$
+DECLARE
+  c CONSTANT int := 1;
+BEGIN
+  c := 2;
+  RETURN c;
+END;
+$$ LANGUAGE plpgsql_v8;
+ERROR:  PL/pgSQL syntax error: variable "c" is declared CONSTANT at or near "c" (line 5)
+-- NOT NULL without default rejected at compile time
+CREATE FUNCTION bad_notnull_decl() RETURNS int AS $$
+DECLARE
+  x int NOT NULL;
+BEGIN
+  RETURN x;
+END;
+$$ LANGUAGE plpgsql_v8;
+ERROR:  variable "x" declared NOT NULL must have a default
+-- Assigning NULL to NOT NULL variable raises 22004 at runtime
+CREATE FUNCTION runtime_notnull_violation(v int) RETURNS int AS $$
+DECLARE
+  x int NOT NULL := 1;
+BEGIN
+  x := v;
+  RETURN x;
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT runtime_notnull_violation(NULL);
+ERROR:  null value cannot be assigned to variable "x" declared NOT NULL
+-- Invalid FOR loop step <= 0 raises 22023 at runtime
+DO $$
+BEGIN
+  FOR i IN 1 .. 5 BY 0 LOOP
+    NULL;
+  END LOOP;
+END;
+$$ LANGUAGE plpgsql_v8;
+ERROR:  step size must be greater than zero
+\set VERBOSITY default
+-- Unprivileged role can use LANGUAGE plpgsql_v8 when granted USAGE ON LANGUAGE,
+-- while direct EXECUTE on plv8_plpgsql_handler() and plv8.compile_plpgsql() is revoked from PUBLIC
+CREATE ROLE regress_plpgsql_v8_user;
+GRANT USAGE ON SCHEMA public TO regress_plpgsql_v8_user;
+GRANT CREATE ON SCHEMA public TO regress_plpgsql_v8_user;
+GRANT USAGE ON LANGUAGE plpgsql_v8 TO regress_plpgsql_v8_user;
+SET ROLE regress_plpgsql_v8_user;
+\set VERBOSITY terse
+SELECT plv8.compile_plpgsql('BEGIN RETURN; END;');
+ERROR:  permission denied for function compile_plpgsql
+\set VERBOSITY default
+CREATE FUNCTION unpriv_plpgsql_v8_add(a int, b int) RETURNS int AS $$
+DECLARE
+  s int;
+BEGIN
+  s := a + b;
+  RETURN s;
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT unpriv_plpgsql_v8_add(19, 23);
+ unpriv_plpgsql_v8_add 
+-----------------------
+                    42
+(1 row)
+
+DROP FUNCTION unpriv_plpgsql_v8_add(int, int);
+RESET ROLE;
+REVOKE ALL ON SCHEMA public FROM regress_plpgsql_v8_user;
+REVOKE USAGE ON LANGUAGE plpgsql_v8 FROM regress_plpgsql_v8_user;
+DROP ROLE regress_plpgsql_v8_user;
+-- ============================================================================
+-- 10. Edge Cases: RAISE EXCEPTION without handler, CASE in EXCEPTION block,
+--     nested subtransaction EXIT/CONTINUE, 64-bit bigint, and DML column lists
+-- ============================================================================
+-- 10a. RAISE EXCEPTION in a block without an EXCEPTION handler
+CREATE FUNCTION test_raise_no_handler(x int) RETURNS int AS $$
+BEGIN
+  IF x < 0 THEN
+    RAISE EXCEPTION 'negative input: %', x USING ERRCODE = '22023';
+  END IF;
+  RETURN x * 2;
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT test_raise_no_handler(21);
+ test_raise_no_handler 
+-----------------------
+                    42
+(1 row)
+
+\set VERBOSITY terse
+SELECT test_raise_no_handler(-5);
+ERROR:  negative input: -5
+\set VERBOSITY default
+DROP FUNCTION test_raise_no_handler(int);
+-- 10b. Searched CASE expression compiled to pure JS (no evalSql) and inside BEGIN..EXCEPTION..END
+SELECT plv8.compile_plpgsql('BEGIN RETURN CASE WHEN 1 < 2 THEN 10 ELSE 20 END; END;') NOT LIKE '%evalSql%' AS searched_case_fast_path;
+ searched_case_fast_path 
+-------------------------
+ t
+(1 row)
+
+CREATE FUNCTION test_case_in_exception_block(a int, b int) RETURNS text AS $$
+DECLARE
+  label text;
+  q int;
+BEGIN
+  label := CASE WHEN a > 0 THEN 'pos' WHEN a = 0 THEN 'zero' ELSE 'neg' END;
+  q := a / b;
+  RETURN label || ':' || q;
+EXCEPTION
+  WHEN division_by_zero THEN
+    RETURN label || ':div0';
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT test_case_in_exception_block(10, 2), test_case_in_exception_block(-3, 0);
+ test_case_in_exception_block | test_case_in_exception_block 
+------------------------------+------------------------------
+ pos:5                        | neg:div0
+(1 row)
+
+DROP FUNCTION test_case_in_exception_block(int, int);
+-- 10c. EXIT and CONTINUE from inner BEGIN..EXCEPTION..END targeting loop inside outer BEGIN..EXCEPTION..END
+CREATE FUNCTION test_nested_subtran_loop_exit() RETURNS text AS $$
+DECLARE
+  i int := 0;
+  acc int := 0;
+  after_loop text := 'not_reached';
+BEGIN
+  LOOP
+    i := i + 1;
+    BEGIN
+      IF i = 2 THEN
+        CONTINUE;
+      END IF;
+      IF i = 4 THEN
+        EXIT;
+      END IF;
+      acc := acc + i * 10;
+    EXCEPTION
+      WHEN OTHERS THEN
+        acc := -999;
+    END;
+    acc := acc + 1;
+  END LOOP;
+  after_loop := 'reached:' || acc || ':i=' || i;
+  RETURN after_loop;
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN 'outer_err';
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT test_nested_subtran_loop_exit();
+ test_nested_subtran_loop_exit 
+-------------------------------
+ reached:42:i=4
+(1 row)
+
+DROP FUNCTION test_nested_subtran_loop_exit();
+-- 10d. 64-bit bigint comparisons (> INT32_MAX) and exact arithmetic (> 2^53 - 1)
+CREATE FUNCTION test_bigint_ops(v bigint) RETURNS jsonb AS $$
+DECLARE
+  b bigint := 5000000000;
+  big1 bigint := 9007199254740993;
+  big2 bigint;
+  max_b bigint := 9223372036854775806;
+  overflow_caught boolean := false;
+BEGIN
+  big2 := big1 + 1;
+  max_b := max_b + 1;
+  BEGIN
+    max_b := max_b + 1;
+  EXCEPTION
+    WHEN numeric_value_out_of_range THEN
+      overflow_caught := true;
+  END;
+  RETURN jsonb_build_object(
+    'eq_5b', (v = 5000000000),
+    'eq_var', (v = b),
+    'le_5b', (v <= 5000000000),
+    'gt_4b', (v > 4000000000),
+    'big2_text', big2::text,
+    'max_b_text', max_b::text,
+    'overflow_caught', overflow_caught
+  );
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT jsonb_pretty(test_bigint_ops(5000000000));
+               jsonb_pretty               
+------------------------------------------
+ {                                       +
+     "eq_5b": true,                      +
+     "gt_4b": true,                      +
+     "le_5b": true,                      +
+     "eq_var": true,                     +
+     "big2_text": "9007199254740994",    +
+     "max_b_text": "9223372036854775807",+
+     "overflow_caught": true             +
+ }
+(1 row)
+
+DROP FUNCTION test_bigint_ops(bigint);
+-- 10e. ON CONFLICT (col), WITH cte (col) AS (...), and UPDATE ... SET (col1, col2) = ...
+--      when local PL/pgSQL variables have the same names as table columns
+CREATE FUNCTION test_dml_col_shadowing() RETURNS jsonb AS $$
+DECLARE
+  id int := 10;
+  name text := 'shadow_alpha';
+  qty int := 99;
+  cte_res text;
+  final_row plpgsql_v8_items%ROWTYPE;
+BEGIN
+  INSERT INTO plpgsql_v8_items (id, name, qty)
+    VALUES (id, name, qty)
+    ON CONFLICT (id) DO UPDATE SET qty = plpgsql_v8_items.qty + EXCLUDED.qty;
+
+  UPDATE plpgsql_v8_items
+    SET (name, qty) = (name, qty + 1)
+    WHERE plpgsql_v8_items.id = id;
+
+  WITH c (id, name) AS (
+    SELECT p.id, p.name FROM plpgsql_v8_items p WHERE p.id = id
+  )
+  SELECT c.id || ':' || c.name INTO cte_res FROM c;
+
+  SELECT * INTO final_row FROM plpgsql_v8_items p WHERE p.id = id;
+
+  RETURN jsonb_build_object(
+    'cte_res', cte_res,
+    'final_name', final_row.name,
+    'final_qty', final_row.qty
+  );
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT jsonb_pretty(test_dml_col_shadowing());
+           jsonb_pretty            
+-----------------------------------
+ {                                +
+     "cte_res": "10:shadow_alpha",+
+     "final_qty": 100,            +
+     "final_name": "shadow_alpha" +
+ }
+(1 row)
+
+DROP FUNCTION test_dml_col_shadowing();
+-- 10f. plv8.prepare, plan.cursor, and plan.execute error recovery in JS try/catch without relcache leaks
+CREATE FUNCTION test_prepare_cursor_error_recovery() RETURNS jsonb AS $$
+  var res = {};
+  try {
+    plv8.prepare('UPDATE plpgsql_v8_items SET non_existent_col = 1');
+  } catch (e) {
+    res.prep_bad_col = e.sqlerrcode;
+  }
+  try {
+    plv8.prepare('SELECT $1', ['nonexistent_type_xyz']);
+  } catch (e) {
+    res.prep_bad_type = e.sqlerrcode;
+  }
+  var p = plv8.prepare('SELECT $1::plpgsql_v8_posint AS x', ['plpgsql_v8_posint']);
+  try {
+    var c = p.cursor([-5]);
+    c.close();
+  } catch (e) {
+    res.cursor_domain_err = e.sqlerrcode;
+  }
+  try {
+    p.execute([-5]);
+  } catch (e) {
+    res.exec_domain_err = e.sqlerrcode;
+  }
+  p.free();
+  return res;
+$$ LANGUAGE plv8;
+SELECT jsonb_pretty(test_prepare_cursor_error_recovery());
+           jsonb_pretty           
+----------------------------------
+ {                               +
+     "prep_bad_col": "42703",    +
+     "prep_bad_type": "42704",   +
+     "exec_domain_err": "23514", +
+     "cursor_domain_err": "23514"+
+ }
+(1 row)
+
+DROP FUNCTION test_prepare_cursor_error_recovery();
+-- 10g. FETCH PRIOR / RELATIVE -1, integer FOR loop FOUND, nested EXCEPTION stacked diagnostics, and 0Z002
+CREATE FUNCTION test_cursor_prior_and_for_found() RETURNS jsonb AS $$
+DECLARE
+  cur CURSOR FOR SELECT id, name FROM plpgsql_v8_items WHERE id <= 3 ORDER BY id;
+  v_id int;
+  v_name text;
+  prior_item text;
+  rel_neg1_item text;
+  found_nonempty boolean;
+  found_empty boolean;
+  nested_detail text;
+  nested_table text;
+  nested_constraint text;
+  outside_stacked_state text;
+  class_cond_state text;
+BEGIN
+  OPEN cur;
+  FETCH NEXT FROM cur INTO v_id, v_name;
+  FETCH NEXT FROM cur INTO v_id, v_name;
+  FETCH NEXT FROM cur INTO v_id, v_name;
+  FETCH PRIOR FROM cur INTO v_id, v_name;
+  prior_item := v_id || ':' || v_name;
+  FETCH RELATIVE -1 FROM cur INTO v_id, v_name;
+  rel_neg1_item := v_id || ':' || v_name;
+  CLOSE cur;
+
+  FOR i IN 1 .. 2 LOOP
+    PERFORM id FROM plpgsql_v8_items WHERE id = -999;
+  END LOOP;
+  found_nonempty := FOUND;
+
+  FOR i IN 5 .. 1 LOOP
+    NULL;
+  END LOOP;
+  found_empty := FOUND;
+
+  BEGIN
+    RAISE EXCEPTION 'outer boom' USING
+      ERRCODE = '23505',
+      DETAIL = 'outer detail',
+      TABLE = 'outer_tbl',
+      CONSTRAINT = 'outer_uk';
+  EXCEPTION
+    WHEN unique_violation THEN
+      BEGIN
+        RAISE EXCEPTION 'inner boom' USING
+          ERRCODE = '22012',
+          DETAIL = 'inner detail',
+          TABLE = 'inner_tbl',
+          CONSTRAINT = 'inner_ck';
+      EXCEPTION
+        WHEN division_by_zero THEN
+          NULL;
+      END;
+      GET STACKED DIAGNOSTICS
+        nested_detail = PG_EXCEPTION_DETAIL,
+        nested_table = TABLE_NAME,
+        nested_constraint = CONSTRAINT_NAME;
+  END;
+
+  BEGIN
+    GET STACKED DIAGNOSTICS outside_stacked_state = RETURNED_SQLSTATE;
+  EXCEPTION
+    WHEN stacked_diagnostics_accessed_without_active_handler THEN
+      outside_stacked_state := SQLSTATE;
+  END;
+
+  BEGIN
+    RAISE data_exception;
+  EXCEPTION
+    WHEN data_exception THEN
+      class_cond_state := SQLSTATE;
+  END;
+
+  RETURN jsonb_build_object(
+    'prior_item', prior_item,
+    'rel_neg1_item', rel_neg1_item,
+    'found_nonempty', found_nonempty,
+    'found_empty', found_empty,
+    'nested_detail', nested_detail,
+    'nested_table', nested_table,
+    'nested_constraint', nested_constraint,
+    'outside_stacked_state', outside_stacked_state,
+    'class_cond_state', class_cond_state
+  );
+END;
+$$ LANGUAGE plpgsql_v8;
+SELECT jsonb_pretty(test_cursor_prior_and_for_found());
+             jsonb_pretty             
+--------------------------------------
+ {                                   +
+     "prior_item": "2:beta",         +
+     "found_empty": false,           +
+     "nested_table": "outer_tbl",    +
+     "nested_detail": "outer detail",+
+     "rel_neg1_item": "1:alpha",     +
+     "found_nonempty": true,         +
+     "class_cond_state": "22000",    +
+     "nested_constraint": "outer_uk",+
+     "outside_stacked_state": "0Z002"+
+ }
+(1 row)
+
+DROP FUNCTION test_cursor_prior_and_for_found();
+-- Cleanup
+DROP FUNCTION runtime_notnull_violation(int);
+DROP TRIGGER tr_plpgsql_v8 ON plpgsql_v8_items;
+DROP FUNCTION plpgsql_v8_trig_fn();
+DROP TABLE plpgsql_v8_audit;
+DROP FUNCTION test_cursors_v8();
+DROP PROCEDURE test_proc_v8(int, text, int);
+DROP FUNCTION test_returns_table(int);
+DROP FUNCTION test_srf_scalar(int);
+DROP FUNCTION test_out_params(int, int);
+DROP FUNCTION test_raise_and_assert(bool);
+DROP FUNCTION test_subtran_rollback_and_return();
+DROP FUNCTION test_sql_operations();
+DROP TABLE plpgsql_v8_items;
+DROP FUNCTION test_case_not_found(int);
+DROP FUNCTION test_control_flow(int);
+DROP FUNCTION test_expr_features(text, int);
+DROP FUNCTION test_math_and_3vl(int, int);
+DROP FUNCTION test_decl_and_expr(int, int);
+DROP FUNCTION sum_pair_v8(plpgsql_v8_pair);
+DROP FUNCTION make_pair_v8(plpgsql_v8_posint, text);
+DROP DOMAIN plpgsql_v8_posint;
+DROP TYPE plpgsql_v8_pair;
