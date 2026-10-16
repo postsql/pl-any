@@ -1,0 +1,5 @@
+# JSON Schema (Draft 2020-12) trusted procedural language for PostgreSQL on V8 / QuickJS (pl_jsonschema / jsonschema)
+comment = 'JSON Schema (Draft 2020-12) trusted procedural language for PostgreSQL on V8 / QuickJS (pl_jsonschema / jsonschema)'
+default_version = '1.0'
+relocatable = true
+trusted = true
