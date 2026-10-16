@@ -3198,6 +3198,12 @@ const PgqCodegenSql = (function () {
           const latRel = lateralState.envByAlias[varName];
           const latCol = latRel.columns[propName];
           if (!latCol) {
+            if (latRel.isDynamicRte && lateralState.mode === "TYPE_INFER") {
+              out += "(NULL)";
+              prevEnd = exprTokens[i + 2].end;
+              i += 3;
+              continue;
+            }
             throwPgqError(
               'column "' + propName + '" does not exist on relation "' + varName + '"',
               "42703"
@@ -3287,6 +3293,7 @@ const PgqCodegenSql = (function () {
         envByAlias[rel.alias] = {
           alias: rel.alias,
           rtindex: rel.rtindex,
+          isDynamicRte: Boolean(rel.isDynamicRte),
           columns: colMap
         };
       }
@@ -3321,6 +3328,7 @@ const PgqCodegenSql = (function () {
     }
 
     return {
+      mode: mode,
       envByAlias: envByAlias,
       unqualifiedCols: unqualifiedCols,
       usedVars: usedVars,
@@ -4389,108 +4397,211 @@ const PlPgq = (function () {
    * like `COLUMNS (x1.a AS outer_id)`.
    */
   function extractPrecedingFromTables(tokens, gtTokenIdx) {
-    // Walk backwards from gtTokenIdx at the same parenthesis depth to find `FROM`
+    // Walk backwards from gtTokenIdx to collect `FROM` clauses of the current
+    // query block and any enclosing parent query blocks (for correlated subqueries).
     let depth = 0;
-    let fromIdx = -1;
+    const fromIndices = [];
     for (let i = gtTokenIdx - 1; i >= 0; i--) {
       const t = tokens[i];
-      if (t.value === ")") depth++;
-      else if (t.value === "(") {
-        if (depth === 0) break;
-        depth--;
+      if (t.value === ")") {
+        depth++;
+      } else if (t.value === "(") {
+        if (depth > 0) depth--;
       } else if (depth === 0 && t.type === "IDENT" && !t.quoted && t.lower === "from") {
-        fromIdx = i;
-        break;
+        fromIndices.unshift(i);
       }
     }
-    if (fromIdx === -1) return [];
+    if (fromIndices.length === 0) return [];
+
+    const END_FROM_CLAUSE_KW = {
+      where: true, group: true, having: true, window: true, order: true,
+      limit: true, offset: true, fetch: true, for: true, union: true,
+      intersect: true, except: true, select: true
+    };
 
     const lateralEnv = [];
-    let i = fromIdx + 1;
     let rtindex = 1;
-    while (i < gtTokenIdx) {
-      const t = tokens[i];
-      if (t.value === "(") {
-        // Skip subquery
-        let d = 1;
-        i++;
-        while (i < gtTokenIdx && d > 0) {
-          if (tokens[i].value === "(") d++;
-          else if (tokens[i].value === ")") d--;
-          i++;
+
+    for (let f = 0; f < fromIndices.length; f++) {
+      let i = fromIndices[f] + 1;
+      while (i < gtTokenIdx) {
+        const t = tokens[i];
+        if (t.value === ")") {
+          break;
         }
-        continue;
-      }
-      if (t.type === "IDENT" && !t.quoted && (t.lower === "lateral" || t.lower === "only")) {
-        i++;
-        continue;
-      }
-      if (t.type === "IDENT") {
-        let schema = null;
-        let relname = t.value;
-        i++;
-        if (i < gtTokenIdx && tokens[i].value === "." && i + 1 < gtTokenIdx && tokens[i + 1].type === "IDENT") {
-          schema = relname;
-          relname = tokens[i + 1].value;
-          i += 2;
+        if (t.type === "IDENT" && !t.quoted && END_FROM_CLAUSE_KW[t.lower]) {
+          break;
         }
-        let alias = relname;
-        if (i < gtTokenIdx && tokens[i].type === "IDENT" && !tokens[i].quoted && tokens[i].lower === "as") {
+        if (t.value === "(") {
+          // Subquery in FROM: `(SELECT ...) [AS] alias`
+          let d = 1;
           i++;
-          if (i < gtTokenIdx && tokens[i].type === "IDENT") {
+          while (i < gtTokenIdx && d > 0) {
+            if (tokens[i].value === "(") d++;
+            else if (tokens[i].value === ")") d--;
+            i++;
+          }
+          let subAlias = null;
+          if (i < gtTokenIdx && tokens[i].type === "IDENT" && !tokens[i].quoted && tokens[i].lower === "as") {
+            i++;
+            if (i < gtTokenIdx && tokens[i].type === "IDENT") {
+              subAlias = tokens[i].value;
+              i++;
+            }
+          } else if (
+            i < gtTokenIdx &&
+            tokens[i].type === "IDENT" &&
+            !SQL_KEYWORDS_AFTER_FROM[tokens[i].lower] &&
+            tokens[i].lower !== "join"
+          ) {
+            subAlias = tokens[i].value;
+            i++;
+          }
+          if (subAlias) {
+            lateralEnv.push({
+              alias: subAlias,
+              rtindex: rtindex++,
+              isDynamicRte: true,
+              columns: []
+            });
+          }
+        } else if (
+          t.type === "IDENT" &&
+          !t.quoted &&
+          (t.lower === "lateral" ||
+            t.lower === "only" ||
+            t.lower === "natural" ||
+            t.lower === "inner" ||
+            t.lower === "left" ||
+            t.lower === "right" ||
+            t.lower === "full" ||
+            t.lower === "outer" ||
+            t.lower === "cross" ||
+            t.lower === "join")
+        ) {
+          i++;
+          continue;
+        } else if (t.type === "IDENT") {
+          let schema = null;
+          let relname = t.value;
+          i++;
+          if (i < gtTokenIdx && tokens[i].value === "." && i + 1 < gtTokenIdx && tokens[i + 1].type === "IDENT") {
+            schema = relname;
+            relname = tokens[i + 1].value;
+            i += 2;
+          }
+
+          let isFuncCall = false;
+          if (i < gtTokenIdx && tokens[i].value === "(") {
+            isFuncCall = true;
+            let d = 1;
+            i++;
+            while (i < gtTokenIdx && d > 0) {
+              if (tokens[i].value === "(") d++;
+              else if (tokens[i].value === ")") d--;
+              i++;
+            }
+          }
+
+          let alias = relname;
+          if (i < gtTokenIdx && tokens[i].type === "IDENT" && !tokens[i].quoted && tokens[i].lower === "as") {
+            i++;
+            if (i < gtTokenIdx && tokens[i].type === "IDENT") {
+              alias = tokens[i].value;
+              i++;
+            }
+          } else if (
+            i < gtTokenIdx &&
+            tokens[i].type === "IDENT" &&
+            !SQL_KEYWORDS_AFTER_FROM[tokens[i].lower] &&
+            tokens[i].lower !== "join"
+          ) {
             alias = tokens[i].value;
             i++;
           }
-        } else if (
-          i < gtTokenIdx &&
-          tokens[i].type === "IDENT" &&
-          !SQL_KEYWORDS_AFTER_FROM[tokens[i].lower] &&
-          tokens[i].lower !== "join"
-        ) {
-          alias = tokens[i].value;
-          i++;
-        }
 
-        // Try resolving relation in pg_catalog
-        const regStr = schema
-          ? PgqLexer.quoteIdent(schema) + "." + PgqLexer.quoteIdent(relname)
-          : PgqLexer.quoteIdent(relname);
-        try {
-          const colRows = plv8.execute(
-            `SELECT a.attnum::int AS attno,
-                    a.attname::text AS name,
-                    a.atttypid::int AS type_oid,
-                    a.atttypmod::int AS typmod,
-                    a.attcollation::int AS collation_oid,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod)::text AS type_sql
-               FROM pg_catalog.pg_attribute a
-              WHERE a.attrelid = pg_catalog.to_regclass($1)
-                AND a.attnum > 0
-                AND NOT a.attisdropped
-              ORDER BY a.attnum`,
-            [regStr]
-          );
-          if (colRows && colRows.length > 0) {
+          // Skip optional column definition list `(col1 type1, ...)`
+          if (i < gtTokenIdx && tokens[i].value === "(") {
+            let d = 1;
+            i++;
+            while (i < gtTokenIdx && d > 0) {
+              if (tokens[i].value === "(") d++;
+              else if (tokens[i].value === ")") d--;
+              i++;
+            }
+          }
+
+          if (isFuncCall) {
             lateralEnv.push({
               alias: alias,
               rtindex: rtindex++,
-              columns: colRows
+              isDynamicRte: true,
+              columns: []
             });
+          } else {
+            const regStr = schema
+              ? PgqLexer.quoteIdent(schema) + "." + PgqLexer.quoteIdent(relname)
+              : PgqLexer.quoteIdent(relname);
+            let addedCatalogRel = false;
+            try {
+              const colRows = plv8.execute(
+                `SELECT a.attnum::int AS attno,
+                        a.attname::text AS name,
+                        a.atttypid::int AS type_oid,
+                        a.atttypmod::int AS typmod,
+                        a.attcollation::int AS collation_oid,
+                        pg_catalog.format_type(a.atttypid, a.atttypmod)::text AS type_sql
+                   FROM pg_catalog.pg_attribute a
+                  WHERE a.attrelid = pg_catalog.to_regclass($1)
+                    AND a.attnum > 0
+                    AND NOT a.attisdropped
+                  ORDER BY a.attnum`,
+                [regStr]
+              );
+              if (colRows && colRows.length > 0) {
+                lateralEnv.push({
+                  alias: alias,
+                  rtindex: rtindex++,
+                  columns: colRows
+                });
+                addedCatalogRel = true;
+              }
+            } catch (_e) {
+              // Ignore catalog lookup error
+            }
+            if (!addedCatalogRel) {
+              lateralEnv.push({
+                alias: alias,
+                rtindex: rtindex++,
+                isDynamicRte: true,
+                columns: []
+              });
+            }
           }
-        } catch (_e) {
-          // Ignore non-table CTE or function item during heuristic parse scan
         }
-      }
-      // Advance to next comma or JOIN
-      while (i < gtTokenIdx && tokens[i].value !== ",") {
-        if (tokens[i].type === "IDENT" && !tokens[i].quoted && tokens[i].lower === "join") {
+        // Advance to next comma or JOIN at depth 0
+        let joinDepth = 0;
+        while (i < gtTokenIdx) {
+          if (tokens[i].value === "(") {
+            joinDepth++;
+          } else if (tokens[i].value === ")") {
+            if (joinDepth === 0) break;
+            joinDepth--;
+          } else if (joinDepth === 0) {
+            if (tokens[i].value === ",") {
+              i++;
+              break;
+            }
+            if (tokens[i].type === "IDENT" && !tokens[i].quoted) {
+              if (END_FROM_CLAUSE_KW[tokens[i].lower]) break;
+              if (tokens[i].lower === "join") {
+                i++;
+                break;
+              }
+            }
+          }
           i++;
-          break;
         }
-        i++;
-      }
-      if (i < gtTokenIdx && tokens[i].value === ",") {
-        i++;
       }
     }
 
