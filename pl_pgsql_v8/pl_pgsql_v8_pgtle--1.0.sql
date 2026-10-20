@@ -6,9 +6,12 @@ SELECT pgtle.install_extension(
   '1.0',
   'PL/pgSQL compiled to JavaScript on V8 (pl_pgsql_v8 / plpgsql_v8 / pl/pgsql+v8)',
 $tle_pkg_pl_pgsql_v8$
-CREATE OR REPLACE FUNCTION plv8_plpgsql_handler()
-RETURNS language_handler AS
-$plpgsql_v8_Compiler$
+DO $plpgsql_v8_bootstrap$
+DECLARE
+  v_lang text;
+  v_inline text;
+  v_validator text;
+  v_compiler_src text := $plpgsql_v8_Compiler$
 if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
   globalThis.__plpgsql_v8_compile = (function() {
     const COND_MAP = {
@@ -232,6 +235,12 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
     };
 
     function ensureRuntime() {
+      if (typeof globalThis.plv8 === 'undefined' && typeof globalThis.pljs !== 'undefined') {
+        globalThis.plv8 = globalThis.pljs;
+      }
+      if (typeof globalThis.pljs === 'undefined' && typeof globalThis.plv8 !== 'undefined') {
+        globalThis.pljs = globalThis.plv8;
+      }
       if (globalThis.__plpgsql_v8_rt) return globalThis.__plpgsql_v8_rt;
       const rt = {
         COND_MAP: COND_MAP,
@@ -422,6 +431,142 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
           }
           return null;
         },
+        isDecStr: function(v) {
+          if (typeof v !== 'string') return false;
+          const s = v.trim();
+          return /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(s);
+        },
+        isHighPrecDec: function(v) {
+          if (typeof v !== 'string') return false;
+          const s = v.trim();
+          if (!/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(s)) return false;
+          const digits = s.replace(/^[+-]/, '').replace('.', '').replace(/^0+/, '');
+          if (digits.length > 15 || (s.indexOf('.') !== -1 && digits.length >= 15)) return true;
+          const dotIdx = s.indexOf('.');
+          if (dotIdx !== -1 && (s.length - dotIdx - 1) > 12) return true;
+          return false;
+        },
+        parseDecParts: function(v) {
+          const s = String(v).trim();
+          const m = s.match(/^([+-])?(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/);
+          if (!m) return null;
+          const sign = (m[1] === '-') ? -1n : 1n;
+          const intStr = m[2] || '0';
+          const fracStr = m[3] !== undefined ? m[3] : (m[4] || '');
+          const exp = m[5] !== undefined ? parseInt(m[5], 10) : 0;
+          let scale = fracStr.length - exp;
+          let digits = (intStr + fracStr).replace(/^0+/, '') || '0';
+          if (scale < 0) {
+            if (digits !== '0') digits += '0'.repeat(-scale);
+            scale = 0;
+          }
+          const bi = (digits === '0') ? 0n : (sign * BigInt(digits));
+          return { bi: bi, scale: scale };
+        },
+        formatDecParts: function(bi, scale, trimTrailingZeros) {
+          if (scale <= 0) return bi.toString();
+          const neg = bi < 0n;
+          const absBi = neg ? -bi : bi;
+          let s = absBi.toString();
+          while (s.length <= scale) s = '0' + s;
+          const intPart = s.slice(0, s.length - scale) || '0';
+          let fracPart = s.slice(s.length - scale);
+          if (trimTrailingZeros) {
+            fracPart = fracPart.replace(/0+$/, '');
+          }
+          if (fracPart.length === 0) {
+            return (neg && intPart !== '0' ? '-' : '') + intPart;
+          }
+          return (neg ? '-' : '') + intPart + '.' + fracPart;
+        },
+        pow10n: function(exp) {
+          if (exp <= 0) return 1n;
+          return 10n ** BigInt(exp);
+        },
+        decAdd: function(a, b) {
+          const pa = rt.parseDecParts(a), pb = rt.parseDecParts(b);
+          if (!pa || !pb) return null;
+          const scale = Math.max(pa.scale, pb.scale);
+          const va = pa.bi * rt.pow10n(scale - pa.scale);
+          const vb = pb.bi * rt.pow10n(scale - pb.scale);
+          return rt.formatDecParts(va + vb, scale, false);
+        },
+        decSub: function(a, b) {
+          const pa = rt.parseDecParts(a), pb = rt.parseDecParts(b);
+          if (!pa || !pb) return null;
+          const scale = Math.max(pa.scale, pb.scale);
+          const va = pa.bi * rt.pow10n(scale - pa.scale);
+          const vb = pb.bi * rt.pow10n(scale - pb.scale);
+          return rt.formatDecParts(va - vb, scale, false);
+        },
+        decMul: function(a, b) {
+          const pa = rt.parseDecParts(a), pb = rt.parseDecParts(b);
+          if (!pa || !pb) return null;
+          return rt.formatDecParts(pa.bi * pb.bi, pa.scale + pb.scale, false);
+        },
+        decDiv: function(a, b) {
+          const pa = rt.parseDecParts(a), pb = rt.parseDecParts(b);
+          if (!pa || !pb) return null;
+          if (pb.bi === 0n) throw rt.makeError('22012', 'division by zero');
+          const targetScale = Math.max(20, pa.scale + pb.scale + 16);
+          const shift = targetScale - pa.scale + pb.scale;
+          const num = (shift >= 0) ? (pa.bi * rt.pow10n(shift)) : (pa.bi / rt.pow10n(-shift));
+          const den = pb.bi;
+          const neg = (num < 0n) !== (den < 0n);
+          const absNum = num < 0n ? -num : num;
+          const absDen = den < 0n ? -den : den;
+          let q = absNum / absDen;
+          const rem = absNum % absDen;
+          if (rem * 2n >= absDen) q += 1n;
+          if (neg) q = -q;
+          return rt.formatDecParts(q, targetScale, true);
+        },
+        decMod: function(a, b) {
+          const pa = rt.parseDecParts(a), pb = rt.parseDecParts(b);
+          if (!pa || !pb) return null;
+          if (pb.bi === 0n) throw rt.makeError('22012', 'division by zero');
+          const scale = Math.max(pa.scale, pb.scale);
+          const va = pa.bi * rt.pow10n(scale - pa.scale);
+          const vb = pb.bi * rt.pow10n(scale - pb.scale);
+          return rt.formatDecParts(va % vb, scale, false);
+        },
+        decCmp: function(a, b) {
+          const pa = rt.parseDecParts(a), pb = rt.parseDecParts(b);
+          if (!pa || !pb) return null;
+          const scale = Math.max(pa.scale, pb.scale);
+          const va = pa.bi * rt.pow10n(scale - pa.scale);
+          const vb = pb.bi * rt.pow10n(scale - pb.scale);
+          return va < vb ? -1 : (va > vb ? 1 : 0);
+        },
+        decRound: function(v, targetScale) {
+          const p = rt.parseDecParts(v);
+          if (!p) return null;
+          const sc = (targetScale !== undefined && targetScale !== null) ? Math.trunc(Number(targetScale)) : 0;
+          if (sc >= p.scale) {
+            return rt.formatDecParts(p.bi * rt.pow10n(sc - p.scale), sc, false);
+          }
+          const drop = p.scale - sc;
+          const factor = rt.pow10n(drop);
+          const neg = p.bi < 0n;
+          const absBi = neg ? -p.bi : p.bi;
+          let q = absBi / factor;
+          const rem = absBi % factor;
+          if (rem * 2n >= factor) q += 1n;
+          if (neg) q = -q;
+          return sc >= 0 ? rt.formatDecParts(q, sc, false) : (q * rt.pow10n(-sc)).toString();
+        },
+        decTrunc: function(v, targetScale) {
+          const p = rt.parseDecParts(v);
+          if (!p) return null;
+          const sc = (targetScale !== undefined && targetScale !== null) ? Math.trunc(Number(targetScale)) : 0;
+          if (sc >= p.scale) {
+            return rt.formatDecParts(p.bi * rt.pow10n(sc - p.scale), sc, false);
+          }
+          const drop = p.scale - sc;
+          const factor = rt.pow10n(drop);
+          const q = p.bi / factor;
+          return sc >= 0 ? rt.formatDecParts(q, sc, false) : (q * rt.pow10n(-sc)).toString();
+        },
         toNum: function(v) {
           if (typeof v === 'number') return v;
           if (typeof v === 'bigint') return Number(v);
@@ -438,31 +583,59 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
         },
         add: function(a, b) {
           if (a === null || a === undefined || b === null || b === undefined) return null;
+          if (rt.isHighPrecDec(a) || rt.isHighPrecDec(b)) {
+            const r = rt.decAdd(a, b);
+            if (r !== null) return r;
+          }
           if (typeof a === 'bigint' || typeof b === 'bigint') {
             const ba = rt.tryBigInt(a), bb = rt.tryBigInt(b);
             if (ba !== null && bb !== null) return rt.normBigInt(ba + bb);
+            if (rt.isDecStr(String(a)) && rt.isDecStr(String(b))) {
+              const r = rt.decAdd(a, b);
+              if (r !== null) return r;
+            }
           }
           return rt.toNum(a) + rt.toNum(b);
         },
         sub: function(a, b) {
           if (a === null || a === undefined || b === null || b === undefined) return null;
+          if (rt.isHighPrecDec(a) || rt.isHighPrecDec(b)) {
+            const r = rt.decSub(a, b);
+            if (r !== null) return r;
+          }
           if (typeof a === 'bigint' || typeof b === 'bigint') {
             const ba = rt.tryBigInt(a), bb = rt.tryBigInt(b);
             if (ba !== null && bb !== null) return rt.normBigInt(ba - bb);
+            if (rt.isDecStr(String(a)) && rt.isDecStr(String(b))) {
+              const r = rt.decSub(a, b);
+              if (r !== null) return r;
+            }
           }
           return rt.toNum(a) - rt.toNum(b);
         },
         mul: function(a, b) {
           if (a === null || a === undefined || b === null || b === undefined) return null;
+          if (rt.isHighPrecDec(a) || rt.isHighPrecDec(b)) {
+            const r = rt.decMul(a, b);
+            if (r !== null) return r;
+          }
           if (typeof a === 'bigint' || typeof b === 'bigint') {
             const ba = rt.tryBigInt(a), bb = rt.tryBigInt(b);
             if (ba !== null && bb !== null) return rt.normBigInt(ba * bb);
+            if (rt.isDecStr(String(a)) && rt.isDecStr(String(b))) {
+              const r = rt.decMul(a, b);
+              if (r !== null) return r;
+            }
           }
           const r = rt.toNum(a) * rt.toNum(b);
           return r === 0 ? 0 : r;
         },
         div: function(a, b) {
           if (a === null || a === undefined || b === null || b === undefined) return null;
+          if (rt.isHighPrecDec(a) || rt.isHighPrecDec(b)) {
+            const r = rt.decDiv(a, b);
+            if (r !== null) return r;
+          }
           const nb = rt.toNum(b);
           if (nb === 0) throw rt.makeError('22012', 'division by zero');
           return rt.toNum(a) / nb;
@@ -483,6 +656,10 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
         },
         mod: function(a, b) {
           if (a === null || a === undefined || b === null || b === undefined) return null;
+          if (rt.isHighPrecDec(a) || rt.isHighPrecDec(b)) {
+            const r = rt.decMod(a, b);
+            if (r !== null) return r;
+          }
           if (typeof a === 'bigint' || typeof b === 'bigint') {
             const ba = rt.tryBigInt(a), bb = rt.tryBigInt(b);
             if (ba !== null && bb !== null) {
@@ -497,15 +674,33 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
         },
         pow: function(a, b) {
           if (a === null || a === undefined || b === null || b === undefined) return null;
+          if (rt.isHighPrecDec(a)) {
+            const expInt = rt.tryBigInt(b);
+            if (expInt !== null && expInt >= 0n && expInt <= 30n) {
+              const pa = rt.parseDecParts(a);
+              if (pa) {
+                const e = Number(expInt);
+                return rt.formatDecParts(pa.bi ** expInt, pa.scale * e, false);
+              }
+            }
+          }
           return Math.pow(rt.toNum(a), rt.toNum(b));
         },
         uplus: function(a) {
           if (a === null || a === undefined) return null;
+          if (rt.isHighPrecDec(a)) {
+            const p = rt.parseDecParts(a);
+            if (p) return rt.formatDecParts(p.bi, p.scale, false);
+          }
           if (typeof a === 'bigint') return rt.normBigInt(a);
           return +rt.toNum(a);
         },
         uminus: function(a) {
           if (a === null || a === undefined) return null;
+          if (rt.isHighPrecDec(a)) {
+            const p = rt.parseDecParts(a);
+            if (p) return rt.formatDecParts(-p.bi, p.scale, false);
+          }
           if (typeof a === 'bigint') return rt.normBigInt(-a);
           const r = -rt.toNum(a);
           return r === 0 ? 0 : r;
@@ -532,10 +727,18 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
             }
             return a.length < b.length ? -1 : (a.length > b.length ? 1 : 0);
           }
+          if ((rt.isHighPrecDec(a) || rt.isHighPrecDec(b)) && rt.isDecStr(String(a)) && rt.isDecStr(String(b))) {
+            const dc = rt.decCmp(a, b);
+            if (dc !== null) return dc;
+          }
           if (typeof a === 'bigint' || typeof b === 'bigint') {
             const ba = rt.tryBigInt(a), bb = rt.tryBigInt(b);
             if (ba !== null && bb !== null) {
               return ba < bb ? -1 : (ba > bb ? 1 : 0);
+            }
+            if (rt.isDecStr(String(a)) && rt.isDecStr(String(b))) {
+              const dc = rt.decCmp(a, b);
+              if (dc !== null) return dc;
             }
             const na = Number(a), nb = Number(b);
             if (!Number.isNaN(na) && !Number.isNaN(nb)) {
@@ -543,6 +746,10 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
             }
           }
           if ((typeof a === 'number' && typeof b === 'string') || (typeof a === 'string' && typeof b === 'number')) {
+            if (rt.isDecStr(String(a)) && rt.isDecStr(String(b))) {
+              const dc = rt.decCmp(a, b);
+              if (dc !== null) return dc;
+            }
             const na = Number(a), nb = Number(b);
             if (!Number.isNaN(na) && !Number.isNaN(nb)) {
               return na < nb ? -1 : (na > nb ? 1 : 0);
@@ -787,8 +994,29 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
             return n === 0 ? 0 : n;
           }
           if (t === 'float4' || t === 'float8' || t === 'real' || t === 'double precision' || t === 'numeric' || t === 'decimal' || t.startsWith('numeric(') || t.startsWith('decimal(')) {
-            let n = rt.toNum(val);
+            const isNumeric = (t === 'numeric' || t === 'decimal' || t.startsWith('numeric(') || t.startsWith('decimal('));
             const m = t.match(/^(?:numeric|decimal)\s*\(\s*(\d+)\s*(?:,\s*(-?\d+))?\s*\)$/);
+            if (isNumeric && rt.isHighPrecDec(val)) {
+              const p = rt.parseDecParts(val);
+              if (p) {
+                if (m) {
+                  const prec = parseInt(m[1], 10);
+                  const scale = m[2] !== undefined ? parseInt(m[2], 10) : 0;
+                  const rounded = rt.decRound(val, scale);
+                  const rp = rt.parseDecParts(rounded);
+                  if (rp) {
+                    const absDigits = (rp.bi < 0n ? -rp.bi : rp.bi).toString();
+                    const intDigits = scale > 0 ? Math.max(0, absDigits.length - scale) : absDigits.length + (-scale);
+                    if (rp.bi !== 0n && intDigits > prec - scale) {
+                      throw rt.makeError('22003', 'numeric field overflow');
+                    }
+                  }
+                  return rounded;
+                }
+                return String(val).trim();
+              }
+            }
+            let n = rt.toNum(val);
             if (m) {
               const scale = m[2] !== undefined ? parseInt(m[2], 10) : 0;
               const factor = Math.pow(10, scale);
@@ -825,8 +1053,109 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
           }
           return val;
         },
+        _planCache: Object.create(null),
+        _planCacheGen: null,
+        _typeCache: Object.create(null),
+        _inferParamTypes: function(params) {
+          if (!params || params.length === 0) return [];
+          const types = new Array(params.length);
+          for (let i = 0; i < params.length; i++) {
+            const v = params[i];
+            if (v === null || v === undefined) {
+              types[i] = 'text';
+            } else if (typeof v === 'boolean') {
+              types[i] = 'bool';
+            } else if (typeof v === 'bigint') {
+              types[i] = 'int8';
+            } else if (typeof v === 'number') {
+              if (Number.isInteger(v)) {
+                types[i] = (v >= -2147483648 && v <= 2147483647) ? 'int4' : 'int8';
+              } else {
+                types[i] = 'float8';
+              }
+            } else if (v instanceof Date) {
+              types[i] = 'timestamptz';
+            } else {
+              types[i] = 'text';
+            }
+          }
+          return types;
+        },
+        _canCacheParamVal: function(v) {
+          if (v === null || v === undefined) return true;
+          const t = typeof v;
+          if (t === 'boolean' || t === 'number' || t === 'bigint' || t === 'string') return true;
+          if (v instanceof Date) return true;
+          return false;
+        },
+        _getPlan: function(sql, params) {
+          const pg = rt.pg();
+          if (typeof pg.prepare !== 'function') return null;
+          if (params && params.length > 0) {
+            for (let i = 0; i < params.length; i++) {
+              if (!rt._canCacheParamVal(params[i])) return null;
+            }
+          }
+          if (typeof pg.proc_cache_key === 'function') {
+            const curGen = pg.proc_cache_key('*');
+            if (rt._planCacheGen !== null && rt._planCacheGen !== curGen) {
+              const keys = Object.keys(rt._planCache);
+              for (let i = 0; i < keys.length; i++) {
+                const entry = rt._planCache[keys[i]];
+                if (entry && entry.plan) {
+                  try { entry.plan.free(); } catch (_) {}
+                }
+              }
+              rt._planCache = Object.create(null);
+              rt._typeCache = Object.create(null);
+            }
+            rt._planCacheGen = curGen;
+          }
+          const key = sql;
+          const existing = rt._planCache[key];
+          if (existing && existing.plan) return existing.plan;
+          if (existing && existing.uncacheable) return null;
+          const trimmed = sql.trim();
+          if (!/^(?:SELECT|WITH|VALUES|INSERT|UPDATE|DELETE)\b/i.test(trimmed)) {
+            rt._planCache[key] = { plan: null, uncacheable: true };
+            return null;
+          }
+          try {
+            const plan = pg.prepare(sql);
+            rt._planCache[key] = { plan: plan, uncacheable: false };
+            return plan;
+          } catch (e) {
+            rt._planCache[key] = { plan: null, uncacheable: true };
+            return null;
+          }
+        },
+        execSql: function(sql, params, isStatic) {
+          if (sql === null || sql === undefined) {
+            throw rt.makeError('22004', 'query string argument of EXECUTE is null');
+          }
+          const pg = rt.pg();
+          const s = String(sql);
+          const p = params || [];
+          if (isStatic) {
+            const plan = rt._getPlan(s, p);
+            if (plan) {
+              try {
+                return (p.length > 0) ? plan.execute(p) : plan.execute();
+              } catch (e) {
+                const msg = String(e && e.message ? e.message : e);
+                if (/cached plan must not change result type/i.test(msg)) {
+                  try { plan.free(); } catch (_) {}
+                  rt._planCache = Object.create(null);
+                  return (p.length > 0) ? pg.execute(s, p) : pg.execute(s);
+                }
+                throw e;
+              }
+            }
+          }
+          return (p.length > 0) ? pg.execute(s, p) : pg.execute(s);
+        },
         evalSql: function(sql, params) {
-          const rows = rt.pg().execute(sql, params || []);
+          const rows = rt.execSql(sql, params || [], true);
           if (!rows || rows.length === 0) return null;
           const r = rows[0];
           if (r === null || r === undefined) return null;
@@ -856,32 +1185,54 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
             pg.return_next(val);
           }
         },
-        returnQuery: function(sql, params, isScalar, outColNames) {
+        returnQuery: function(sql, params, isScalar, outColNames, isStatic) {
           if (sql === null || sql === undefined) {
             throw rt.makeError('22004', 'query string argument of EXECUTE is null');
           }
           const pg = rt.pg();
+          const s = String(sql);
+          const p = params || [];
+          if (isStatic) {
+            const plan = rt._getPlan(s, p);
+            if (plan && typeof plan.return_query === 'function') {
+              const n = plan.return_query(p, true);
+              return typeof n === 'number' ? n : 0;
+            }
+          }
           if (typeof pg.return_query === 'function') {
-            const n = pg.return_query(String(sql), params || []);
+            const n = pg.return_query(s, p, true);
             return typeof n === 'number' ? n : 0;
           }
-          const rows = pg.execute(String(sql), params || []) || [];
+          const rows = rt.execSql(s, p, Boolean(isStatic)) || [];
           for (let i = 0; i < rows.length; i++) {
             rt.returnNext(rows[i], isScalar, outColNames);
           }
           return rows.length;
         },
-        openCursor: function(sql, params) {
+        openCursor: function(sql, params, isStatic) {
+          if (sql === null || sql === undefined) {
+            throw rt.makeError('22004', 'query string argument of OPEN is null');
+          }
           const pg = rt.pg();
-          const plan = pg.prepare(sql);
+          const s = String(sql);
+          const p = params || [];
+          if (isStatic) {
+            const cachedPlan = rt._getPlan(s, p);
+            if (cachedPlan) {
+              const portal = cachedPlan.cursor(p);
+              return { plan: cachedPlan, portal: portal, sql: s, cached: true };
+            }
+          }
+          const pTypes = rt._inferParamTypes(p);
+          const plan = (pTypes.length > 0) ? pg.prepare(s, pTypes) : pg.prepare(s);
           let portal;
           try {
-            portal = plan.cursor(params || []);
+            portal = plan.cursor(p);
           } catch (e) {
             try { plan.free(); } catch (_) {}
             throw e;
           }
-          return { plan: plan, portal: portal, sql: sql };
+          return { plan: plan, portal: portal, sql: s, cached: false };
         },
         fetchCursor: function(cur, mode, count) {
           if (!cur || !cur.portal) {
@@ -949,10 +1300,10 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
             cur.portal.close();
           } finally {
             cur.portal = null;
-            if (cur.plan) {
+            if (cur.plan && !cur.cached) {
               try { cur.plan.free(); } catch (e) {}
-              cur.plan = null;
             }
+            cur.plan = null;
           }
         },
         callBuiltin: function(fnName, args) {
@@ -974,6 +1325,10 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
               return (args[0] === null || args[0] === undefined) ? null : String(args[0]).replace(/\s+$/, '');
             case 'abs':
               if (args[0] === null || args[0] === undefined) return null;
+              if (rt.isHighPrecDec(args[0])) {
+                const p = rt.parseDecParts(args[0]);
+                if (p) return rt.formatDecParts(p.bi < 0n ? -p.bi : p.bi, p.scale, false);
+              }
               if (typeof args[0] === 'bigint') return rt.normBigInt(args[0] < 0n ? -args[0] : args[0]);
               return Math.abs(rt.toNum(args[0]));
             case 'ceil':
@@ -983,12 +1338,22 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
               return (args[0] === null || args[0] === undefined) ? null : Math.floor(rt.toNum(args[0]));
             case 'sign':
               if (args[0] === null || args[0] === undefined) return null;
+              if (rt.isHighPrecDec(args[0])) {
+                const p = rt.parseDecParts(args[0]);
+                if (p) return p.bi < 0n ? -1 : (p.bi > 0n ? 1 : 0);
+              }
               if (typeof args[0] === 'bigint') return args[0] < 0n ? -1 : (args[0] > 0n ? 1 : 0);
               return Math.sign(rt.toNum(args[0]));
             case 'sqrt':
               return (args[0] === null || args[0] === undefined) ? null : Math.sqrt(rt.toNum(args[0]));
             case 'round':
               if (args[0] === null || args[0] === undefined) return null;
+              if (rt.isHighPrecDec(args[0])) {
+                if (args.length > 1 && args[1] === null) return null;
+                const sc = (args.length > 1 && args[1] !== undefined) ? Math.trunc(rt.toNum(args[1])) : 0;
+                const r = rt.decRound(args[0], sc);
+                if (r !== null) return r;
+              }
               if (args.length > 1 && args[1] !== undefined) {
                 if (args[1] === null) return null;
                 const f = Math.pow(10, Math.trunc(rt.toNum(args[1])));
@@ -997,6 +1362,12 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
               return Math.round(rt.toNum(args[0]));
             case 'trunc':
               if (args[0] === null || args[0] === undefined) return null;
+              if (rt.isHighPrecDec(args[0])) {
+                if (args.length > 1 && args[1] === null) return null;
+                const sc = (args.length > 1 && args[1] !== undefined) ? Math.trunc(rt.toNum(args[1])) : 0;
+                const r = rt.decTrunc(args[0], sc);
+                if (r !== null) return r;
+              }
               if (args.length > 1 && args[1] !== undefined) {
                 if (args[1] === null) return null;
                 const f = Math.pow(10, Math.trunc(rt.toNum(args[1])));
@@ -1259,16 +1630,43 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
     function compilePlpgsql(src, meta) {
       const rt = ensureRuntime();
       const pg = rt.pg();
+      if (meta && typeof meta === 'object') {
+        meta.preserve_numeric_precision = true;
+      }
       if (typeof src !== 'string') {
         const err = new Error('PL/pgSQL source must be a string');
         err.sqlerrcode = '42601';
         throw err;
       }
 
+      if (!globalThis.__plpgsql_v8_fn_cache) {
+        globalThis.__plpgsql_v8_fn_cache = Object.create(null);
+      }
+      if (!globalThis.__plpgsql_v8_inline_registry) {
+        globalThis.__plpgsql_v8_inline_registry = Object.create(null);
+      }
+
+      const fnOid = (meta && meta.fn_oid) ? Number(meta.fn_oid) : 0;
+      let fnCacheKey = null;
+      if (fnOid > 0 && typeof pg.proc_cache_key === 'function') {
+        const pck = pg.proc_cache_key(String(fnOid));
+        if (pck) {
+          fnCacheKey = String(fnOid) + '\0' + pck + '\0' + src;
+          const cachedFn = globalThis.__plpgsql_v8_fn_cache[fnCacheKey];
+          if (cachedFn && typeof cachedFn.js === 'string') {
+            if (cachedFn.proretset && typeof pg.set_function_support === 'function') {
+              try { pg.set_function_support(fnOid); } catch (_) {}
+            }
+            return cachedFn.js;
+          }
+        }
+      }
+
       let procInfo = {
         proname: (meta && meta.proname) ? String(meta.proname) : null,
-        fn_oid: (meta && meta.fn_oid) ? Number(meta.fn_oid) : 0,
+        fn_oid: fnOid,
         proretset: false,
+        provolatile: 'v',
         rettype_sql: 'void',
         rettype_typtype: 'p',
         is_trigger: (meta && meta.rettype_oid === 2279) || false,
@@ -1280,8 +1678,8 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
 
       if (procInfo.fn_oid > 0) {
         try {
-          const rows = pg.execute(
-            "SELECT p.proname, p.proretset, p.prorettype::oid AS prorettype, " +
+          const rows = rt.execSql(
+            "SELECT p.proname, p.proretset, p.provolatile, p.prorettype::oid AS prorettype, " +
             "pg_catalog.format_type(p.prorettype, NULL) AS rettype_sql, " +
             "t.typtype AS rettype_typtype, " +
             "ARRAY(SELECT pg_catalog.format_type(u, NULL) FROM unnest(p.proargtypes) u) AS in_arg_types, " +
@@ -1291,13 +1689,15 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
             "p.prokind AS prokind " +
             "FROM pg_catalog.pg_proc p " +
             "LEFT JOIN pg_catalog.pg_type t ON t.oid = p.prorettype " +
-            "WHERE p.oid = $1",
-            [procInfo.fn_oid]
+            "WHERE p.oid = $1::oid",
+            [procInfo.fn_oid],
+            true
           );
           if (rows && rows.length > 0) {
             const r = rows[0];
             procInfo.proname = r.proname || procInfo.proname;
             procInfo.proretset = Boolean(r.proretset);
+            procInfo.provolatile = r.provolatile || 'v';
             procInfo.rettype_sql = r.rettype_sql || 'void';
             procInfo.rettype_typtype = r.rettype_typtype || 'b';
             procInfo.is_trigger = (r.rettype_sql === 'trigger' || Number(r.prorettype) === 2279);
@@ -1549,10 +1949,17 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
           if (arg.sqlType === 'record') {
             argKind = 'record';
           } else if (arg.sqlType && !isPolymorphicOrPseudoType(arg.sqlType)) {
-            try {
-              const r = pg.execute("SELECT typtype FROM pg_catalog.pg_type WHERE oid = pg_catalog.to_regtype($1)", [arg.sqlType]);
-              if (r && r.length > 0 && r[0].typtype === 'c') argKind = 'rowtype';
-            } catch (e) {}
+            const cacheKey = 'typtype:' + arg.sqlType;
+            if (rt._typeCache[cacheKey] !== undefined) {
+              if (rt._typeCache[cacheKey] === 'c') argKind = 'rowtype';
+            } else {
+              try {
+                const r = rt.execSql("SELECT typtype FROM pg_catalog.pg_type WHERE oid = pg_catalog.to_regtype($1)", [arg.sqlType], true);
+                const tt = (r && r.length > 0) ? r[0].typtype : null;
+                rt._typeCache[cacheKey] = tt;
+                if (tt === 'c') argKind = 'rowtype';
+              } catch (e) {}
+            }
           }
           const vDesc = {
             jsName: jsName,
@@ -2144,6 +2551,9 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
                   }
                 } catch (e) {}
               }
+              if (rt.isHighPrecDec(numTok.value)) {
+                return { code: JSON.stringify('-' + numTok.value), type: 'numeric' };
+              }
               return { code: '(-' + numTok.value + ')', type: numTok.isFloat ? 'numeric' : 'int4' };
             }
             const sub = parseUnary();
@@ -2250,6 +2660,9 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
                   return { code: t.value + 'n', type: 'int8' };
                 }
               } catch (e) {}
+            }
+            if (rt.isHighPrecDec(t.value)) {
+              return { code: JSON.stringify(t.value), type: 'numeric' };
             }
             return { code: t.value, type: t.isFloat ? 'numeric' : 'int4' };
           }
@@ -2694,23 +3107,31 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
             const relName = rawTypeStr.replace(/%ROWTYPE$/i, '').trim();
             sqlType = relName;
             varKind = 'rowtype';
-            try {
-              const attRows = pg.execute(
-                "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) AS atttype " +
-                "FROM pg_catalog.pg_attribute a " +
-                "WHERE a.attrelid = pg_catalog.to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped " +
-                "ORDER BY a.attnum",
-                [relName]
-              );
-              if (attRows && attRows.length > 0) {
-                fieldNames = [];
-                fieldTypes = Object.create(null);
-                for (let r = 0; r < attRows.length; r++) {
-                  fieldNames.push(attRows[r].attname);
-                  fieldTypes[attRows[r].attname.toLowerCase()] = attRows[r].atttype;
+            const rowKey = 'rowtype:' + relName;
+            if (rt._typeCache[rowKey]) {
+              fieldNames = rt._typeCache[rowKey].fieldNames;
+              fieldTypes = rt._typeCache[rowKey].fieldTypes;
+            } else {
+              try {
+                const attRows = rt.execSql(
+                  "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) AS atttype " +
+                  "FROM pg_catalog.pg_attribute a " +
+                  "WHERE a.attrelid = pg_catalog.to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped " +
+                  "ORDER BY a.attnum",
+                  [relName],
+                  true
+                );
+                if (attRows && attRows.length > 0) {
+                  fieldNames = [];
+                  fieldTypes = Object.create(null);
+                  for (let r = 0; r < attRows.length; r++) {
+                    fieldNames.push(attRows[r].attname);
+                    fieldTypes[attRows[r].attname.toLowerCase()] = attRows[r].atttype;
+                  }
+                  rt._typeCache[rowKey] = { fieldNames: fieldNames, fieldTypes: fieldTypes };
                 }
-              }
-            } catch (e) {}
+              } catch (e) {}
+            }
           } else if (/%TYPE$/i.test(rawTypeStr)) {
             const refStr = rawTypeStr.replace(/%TYPE$/i, '').trim();
             const refVar = lookupVar(refStr);
@@ -2726,45 +3147,68 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
                 if (relVar && relVar.fieldTypes && relVar.fieldTypes[colPart.toLowerCase()]) {
                   sqlType = relVar.fieldTypes[colPart.toLowerCase()];
                 } else {
-                  try {
-                    const r = pg.execute(
-                      "SELECT pg_catalog.format_type(a.atttypid, a.atttypmod) AS atttype " +
-                      "FROM pg_catalog.pg_attribute a " +
-                      "WHERE a.attrelid = pg_catalog.to_regclass($1) AND lower(a.attname) = lower($2) AND a.attnum > 0 AND NOT a.attisdropped",
-                      [relPart, colPart]
-                    );
-                    if (r && r.length > 0) sqlType = r[0].atttype;
-                  } catch (e) {}
+                  const colKey = 'coltype:' + relPart + '.' + colPart.toLowerCase();
+                  if (rt._typeCache[colKey]) {
+                    sqlType = rt._typeCache[colKey];
+                  } else {
+                    try {
+                      const r = rt.execSql(
+                        "SELECT pg_catalog.format_type(a.atttypid, a.atttypmod) AS atttype " +
+                        "FROM pg_catalog.pg_attribute a " +
+                        "WHERE a.attrelid = pg_catalog.to_regclass($1) AND lower(a.attname) = lower($2) AND a.attnum > 0 AND NOT a.attisdropped",
+                        [relPart, colPart],
+                        true
+                      );
+                      if (r && r.length > 0) {
+                        sqlType = r[0].atttype;
+                        rt._typeCache[colKey] = sqlType;
+                      }
+                    } catch (e) {}
+                  }
                 }
               }
               if (!sqlType) sqlType = 'text';
             }
           } else {
             sqlType = rawTypeStr.replace(/\s+/g, ' ');
-            try {
-              const r = pg.execute(
-                "SELECT t.typtype, t.typrelid::oid AS typrelid " +
-                "FROM pg_catalog.pg_type t WHERE t.oid = pg_catalog.to_regtype($1)",
-                [sqlType]
-              );
-              if (r && r.length > 0 && r[0].typtype === 'c') {
+            const compKey = 'comptype:' + sqlType;
+            if (rt._typeCache[compKey] !== undefined) {
+              if (rt._typeCache[compKey]) {
                 varKind = 'rowtype';
-                const attRows = pg.execute(
-                  "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) AS atttype " +
-                  "FROM pg_catalog.pg_attribute a " +
-                  "WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
-                  [r[0].typrelid]
-                );
-                if (attRows && attRows.length > 0) {
-                  fieldNames = [];
-                  fieldTypes = Object.create(null);
-                  for (let a = 0; a < attRows.length; a++) {
-                    fieldNames.push(attRows[a].attname);
-                    fieldTypes[attRows[a].attname.toLowerCase()] = attRows[a].atttype;
-                  }
-                }
+                fieldNames = rt._typeCache[compKey].fieldNames;
+                fieldTypes = rt._typeCache[compKey].fieldTypes;
               }
-            } catch (e) {}
+            } else {
+              try {
+                const r = rt.execSql(
+                  "SELECT t.typtype, t.typrelid::oid AS typrelid " +
+                  "FROM pg_catalog.pg_type t WHERE t.oid = pg_catalog.to_regtype($1)",
+                  [sqlType],
+                  true
+                );
+                if (r && r.length > 0 && r[0].typtype === 'c') {
+                  varKind = 'rowtype';
+                  const attRows = rt.execSql(
+                    "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) AS atttype " +
+                    "FROM pg_catalog.pg_attribute a " +
+                    "WHERE a.attrelid = $1::oid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+                    [r[0].typrelid],
+                    true
+                  );
+                  if (attRows && attRows.length > 0) {
+                    fieldNames = [];
+                    fieldTypes = Object.create(null);
+                    for (let a = 0; a < attRows.length; a++) {
+                      fieldNames.push(attRows[a].attname);
+                      fieldTypes[attRows[a].attname.toLowerCase()] = attRows[a].atttype;
+                    }
+                  }
+                  rt._typeCache[compKey] = { fieldNames: fieldNames, fieldTypes: fieldTypes };
+                } else {
+                  rt._typeCache[compKey] = null;
+                }
+              } catch (e) {}
+            }
           }
 
           if (notNull && !defaultExprSlice) {
@@ -3351,7 +3795,7 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
           const iterVar = '__it_' + varCounter;
           const rowVar = '__row_' + varCounter;
           return '{\n' + implicitDeclLine +
-            curVar.jsName + ' = __rt.openCursor(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + ']);\n' +
+            curVar.jsName + ' = __rt.openCursor(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + '], true);\n' +
             'let ' + iterVar + ' = false;\n' +
             'try {\n' +
             jsLabel + ': while (true) {\n' +
@@ -3398,10 +3842,10 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
             }
             if (curU.length > 0) usingArgs.push(compileExpr(curU).code);
           }
-          rowsExpr = '__pg.execute(' + dynQueryCode + ', [' + usingArgs.join(', ') + '])';
+          rowsExpr = '__rt.execSql(' + dynQueryCode + ', [' + usingArgs.join(', ') + '], false)';
         } else {
           const rw = rewriteSqlTokensWithParams(headerSlice, null);
-          rowsExpr = '__pg.execute(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + '])';
+          rowsExpr = '__rt.execSql(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + '], true)';
         }
 
         loopStack.push({ label: label ? label.toLowerCase() : null, jsLabel: jsLabel, isLoop: true, subtranDepth: subtranDepth });
@@ -3555,14 +3999,14 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
               if (cur.length > 0) uArgs.push(compileExpr(cur).code);
             }
             const rqVar = '__rq_' + (++varCounter);
-            return '{ const ' + rqVar + ' = __rt.returnQuery(' + dynCode + ', [' + uArgs.join(', ') + '], ' + (isScalarSrf ? 'true' : 'false') + ', ' + outColNamesJson + '); ' +
+            return '{ const ' + rqVar + ' = __rt.returnQuery(' + dynCode + ', [' + uArgs.join(', ') + '], ' + (isScalarSrf ? 'true' : 'false') + ', ' + outColNamesJson + ', false); ' +
               '__last_row_count = ' + rqVar + '; __found = (' + rqVar + ' > 0); }';
           } else {
             const qSlice = collectUntil(function(t) { return t.value === ';'; });
             expectVal(';');
             const rw = rewriteSqlTokensWithParams(qSlice, null);
             const rqVar = '__rq_' + (++varCounter);
-            return '{ const ' + rqVar + ' = __rt.returnQuery(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + '], ' + (isScalarSrf ? 'true' : 'false') + ', ' + outColNamesJson + '); ' +
+            return '{ const ' + rqVar + ' = __rt.returnQuery(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + '], ' + (isScalarSrf ? 'true' : 'false') + ', ' + outColNamesJson + ', true); ' +
               '__last_row_count = ' + rqVar + '; __found = (' + rqVar + ' > 0); }';
           }
         }
@@ -3721,7 +4165,7 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
         expectVal(';');
         const rw = rewriteSqlTokensWithParams(slice, null);
         const resVar = '__pf_' + (++varCounter);
-        return '{ const ' + resVar + ' = __pg.execute(' + JSON.stringify('SELECT ' + rw.sql) + ', [' + rw.params.join(', ') + ']); ' +
+        return '{ const ' + resVar + ' = __rt.execSql(' + JSON.stringify('SELECT ' + rw.sql) + ', [' + rw.params.join(', ') + '], true); ' +
           '__last_row_count = Array.isArray(' + resVar + ') ? ' + resVar + '.length : (typeof ' + resVar + ' === "number" ? ' + resVar + ' : 0); ' +
           '__found = (__last_row_count > 0); }';
       }
@@ -3913,12 +4357,12 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
               }
               if (cur.length > 0) uArgs.push(compileExpr(cur).code);
             }
-            return curVar.jsName + ' = __rt.openCursor(' + dynCode + ', [' + uArgs.join(', ') + ']);';
+            return curVar.jsName + ' = __rt.openCursor(' + dynCode + ', [' + uArgs.join(', ') + '], false);';
           } else {
             const qSlice = collectUntil(function(t) { return t.value === ';'; });
             expectVal(';');
             const rw = rewriteSqlTokensWithParams(qSlice, null);
-            return curVar.jsName + ' = __rt.openCursor(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + ']);';
+            return curVar.jsName + ' = __rt.openCursor(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + '], true);';
           }
         }
 
@@ -3952,7 +4396,7 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
           }
         }
         const rw = rewriteSqlTokensWithParams(curVar.queryTokens, extraScope);
-        return curVar.jsName + ' = __rt.openCursor(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + ']);';
+        return curVar.jsName + ' = __rt.openCursor(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + '], true);';
       }
 
       function parseFetchStmt() {
@@ -4125,7 +4569,7 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
           }
 
           const rVar = '__sr_' + (++varCounter);
-          let code = '{\nconst ' + rVar + ' = __pg.execute(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + ']);\n' +
+          let code = '{\nconst ' + rVar + ' = __rt.execSql(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + '], true);\n' +
             'const __rows = Array.isArray(' + rVar + ') ? ' + rVar + ' : [];\n';
           if (isStrict) {
             code += 'if (__rows.length === 0) throw __rt.makeError("P0002", "query returned no rows");\n';
@@ -4139,7 +4583,7 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
 
         const rw = rewriteSqlTokensWithParams(stmtTokens, null);
         const rVar = '__sx_' + (++varCounter);
-        return '{\nconst ' + rVar + ' = __pg.execute(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + ']);\n' +
+        return '{\nconst ' + rVar + ' = __rt.execSql(' + JSON.stringify(rw.sql) + ', [' + rw.params.join(', ') + '], true);\n' +
           '__last_row_count = typeof ' + rVar + ' === "number" ? ' + rVar + ' : (Array.isArray(' + rVar + ') ? ' + rVar + '.length : 0);\n' +
           '__found = (__last_row_count > 0);\n}';
       }
@@ -4170,40 +4614,602 @@ if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
         (defaultRet === 'undefined') ? 'return;' : ('return ' + defaultRet + ';')
       ]).join('\n');
 
+      function analyzeInlinableSrf() {
+        if (!procInfo.proretset || procInfo.is_trigger || procInfo.is_proc) return null;
+        for (let i = 0; i < procInfo.inArgs.length; i++) {
+          if (procInfo.inArgs[i].isInOut) return null;
+        }
+        const env = Object.create(null);
+        for (let i = 0; i < procInfo.inArgs.length; i++) {
+          const arg = procInfo.inArgs[i];
+          const sqlRef = (arg.sqlType && !isPolymorphicOrPseudoType(arg.sqlType))
+            ? ('($' + (arg.inIndex + 1) + '::' + arg.sqlType + ')')
+            : ('$' + (arg.inIndex + 1));
+          const entry = {
+            kind: 'arg',
+            inIndex: arg.inIndex,
+            sqlExpr: sqlRef,
+            sqlType: arg.sqlType || null
+          };
+          env[arg.posParam] = entry;
+          if (arg.name) env[arg.name.toLowerCase()] = entry;
+        }
+
+        let ap = 0;
+        function aPeek(off) { return tokens[ap + (off || 0)] || null; }
+        function aNext() { return tokens[ap++] || null; }
+        function aMatchKw(kw) {
+          const t = aPeek();
+          if (t && t.type === 'ident' && !t.quoted && t.upper === kw) { ap++; return t; }
+          return null;
+        }
+        function aMatchVal(v) {
+          const t = aPeek();
+          if (t && t.value === v) { ap++; return t; }
+          return null;
+        }
+        function aCollectUntil(stopFn) {
+          const out = [];
+          let pD = 0, cD = 0;
+          while (ap < tokens.length) {
+            const t = aPeek();
+            if (pD === 0 && cD === 0 && stopFn(t)) break;
+            if (t.value === '(' || t.value === '[') pD++;
+            else if (t.value === ')' || t.value === ']') { if (pD > 0) pD--; }
+            else if (t.type === 'ident' && !t.quoted) {
+              if (t.upper === 'CASE') cD++;
+              else if (t.upper === 'END' && cD > 0) cD--;
+            }
+            out.push(aNext());
+          }
+          return out;
+        }
+
+        function hasVolatileOrForbiddenTokens(slice) {
+          for (let i = 0; i < slice.length; i++) {
+            const t = slice[i];
+            if (t.type === 'ident' && !t.quoted) {
+              const u = t.upper;
+              if (u === 'FOUND' || u === 'SQLSTATE' || u === 'SQLERRM') return true;
+              if (u === 'NEXTVAL' || u === 'SETVAL' || u === 'CURRVAL' || u === 'LASTVAL' || u === 'RANDOM' || u === 'CLOCK_TIMESTAMP' || u === 'TIMEOFDAY') {
+                if (i + 1 < slice.length && slice[i + 1].value === '(') return true;
+              }
+            }
+          }
+          return false;
+        }
+
+        function rewriteSliceWithEnv(slice) {
+          if (!slice || slice.length === 0) return { sql: '', argIndices: [] };
+          if (hasVolatileOrForbiddenTokens(slice)) return null;
+          const baseOffset = slice[0].pos;
+          const rawSql = src.slice(slice[0].pos, slice[slice.length - 1].end);
+          const reps = [];
+          const usedArgs = [];
+
+          function noteUsedArgs(entry) {
+            if (!entry) return;
+            if (entry.kind === 'arg') {
+              if (usedArgs.indexOf(entry.inIndex) === -1) usedArgs.push(entry.inIndex);
+            } else if (Array.isArray(entry.argIndices)) {
+              for (let u = 0; u < entry.argIndices.length; u++) {
+                if (usedArgs.indexOf(entry.argIndices[u]) === -1) usedArgs.push(entry.argIndices[u]);
+              }
+            }
+          }
+
+          let parenDepth = 0;
+          for (let k = 0; k < slice.length; k++) {
+            const t = slice[k];
+            const prev = k > 0 ? slice[k - 1] : null;
+            const nextTok = k + 1 < slice.length ? slice[k + 1] : null;
+            if (t.value === '(') { parenDepth++; continue; }
+            if (t.value === ')') { if (parenDepth > 0) parenDepth--; continue; }
+
+            if (t.type === 'param') {
+              const e = env[t.value.toLowerCase()];
+              if (!e) return null;
+              noteUsedArgs(e);
+              reps.push({ start: t.pos - baseOffset, end: t.end - baseOffset, text: e.sqlExpr });
+              continue;
+            }
+            if (t.type === 'ident') {
+              if (prev && (prev.value === '.' || prev.value === '::')) continue;
+              if (nextTok && nextTok.value === '(') continue;
+              if (prev && prev.type === 'ident' && !prev.quoted) {
+                const pu = prev.upper;
+                if (pu === 'FROM' || pu === 'JOIN' || pu === 'INTO' || pu === 'UPDATE' ||
+                    pu === 'TABLE' || pu === 'AS' || pu === 'TYPE' || pu === 'SCHEMA') {
+                  continue;
+                }
+              }
+              if (nextTok && nextTok.value === '.' && k + 2 < slice.length && slice[k + 2].type === 'ident') {
+                const firstKey = t.value.toLowerCase();
+                const secondKey = slice[k + 2].value.toLowerCase();
+                if (procInfo.proname && firstKey === procInfo.proname.toLowerCase() && env[secondKey]) {
+                  const e = env[secondKey];
+                  noteUsedArgs(e);
+                  reps.push({ start: t.pos - baseOffset, end: slice[k + 2].end - baseOffset, text: e.sqlExpr });
+                }
+                k += 2;
+                continue;
+              }
+              const e = env[t.value.toLowerCase()];
+              if (e) {
+                if (nextTok && nextTok.value === '[') return null;
+                noteUsedArgs(e);
+                reps.push({ start: t.pos - baseOffset, end: t.end - baseOffset, text: e.sqlExpr });
+              }
+            }
+          }
+
+          let outSql = '';
+          let lastIdx = 0;
+          for (let r = 0; r < reps.length; r++) {
+            outSql += rawSql.slice(lastIdx, reps[r].start) + reps[r].text;
+            lastIdx = reps[r].end;
+          }
+          outSql += rawSql.slice(lastIdx);
+          return { sql: outSql.trim(), argIndices: usedArgs };
+        }
+
+        while (aPeek() && aPeek().type === 'directive') aNext();
+        if (aPeek() && aPeek().value === '<<') {
+          aNext();
+          if (!aPeek() || aPeek().type !== 'ident') return null;
+          aNext();
+          if (!aMatchVal('>>')) return null;
+        }
+        while (aPeek() && aPeek().type === 'directive') aNext();
+        if (aMatchKw('DECLARE')) {
+          while (ap < tokens.length) {
+            if (aPeek().type === 'directive') { aNext(); continue; }
+            if (aPeek().type === 'ident' && !aPeek().quoted && aPeek().upper === 'BEGIN') break;
+            if (aPeek().type === 'ident' && !aPeek().quoted && aPeek().upper === 'DECLARE') { aNext(); continue; }
+            const dSlice = aCollectUntil(function(tk) { return tk.value === ';'; });
+            if (!aMatchVal(';')) return null;
+            if (dSlice.length === 0) continue;
+            const vTok = dSlice[0];
+            if (vTok.type !== 'ident') return null;
+            const vName = vTok.value.toLowerCase();
+            if (dSlice.length >= 4 && dSlice[1].upper === 'ALIAS' && dSlice[2].upper === 'FOR') {
+              const target = env[dSlice[3].value.toLowerCase()];
+              if (!target) return null;
+              env[vName] = target;
+              continue;
+            }
+            for (let k = 1; k < dSlice.length; k++) {
+              if (dSlice[k].type === 'ident' && !dSlice[k].quoted && (dSlice[k].upper === 'CURSOR' || dSlice[k].upper === 'REFCURSOR' || dSlice[k].upper === 'RECORD')) {
+                return null;
+              }
+            }
+            let dIdx = 1;
+            if (dIdx < dSlice.length && dSlice[dIdx].upper === 'CONSTANT') dIdx++;
+            let assignIdx = -1;
+            let pD = 0;
+            for (let k = dIdx; k < dSlice.length; k++) {
+              if (dSlice[k].value === '(' || dSlice[k].value === '[') pD++;
+              else if (dSlice[k].value === ')' || dSlice[k].value === ']') pD--;
+              else if (pD === 0 && (dSlice[k].value === ':=' || dSlice[k].value === '=' || dSlice[k].upper === 'DEFAULT')) {
+                assignIdx = k;
+                break;
+              }
+            }
+            const typePart = (assignIdx !== -1) ? dSlice.slice(dIdx, assignIdx) : dSlice.slice(dIdx);
+            const defPart = (assignIdx !== -1) ? dSlice.slice(assignIdx + 1) : null;
+            let tEnd = typePart.length;
+            if (tEnd >= 2 && typePart[tEnd - 2].upper === 'NOT' && typePart[tEnd - 1].upper === 'NULL') tEnd -= 2;
+            if (tEnd <= 0) return null;
+            const rawType = src.slice(typePart[0].pos, typePart[tEnd - 1].end).trim();
+            if (/%ROWTYPE$/i.test(rawType) || /%TYPE$/i.test(rawType)) return null;
+            let sqlExpr = 'NULL::' + rawType;
+            let argIndices = [];
+            if (defPart && defPart.length > 0) {
+              const rwDef = rewriteSliceWithEnv(defPart);
+              if (!rwDef || !rwDef.sql) return null;
+              sqlExpr = '((' + rwDef.sql + ')::' + rawType + ')';
+              argIndices = rwDef.argIndices;
+            }
+            let jsExpr = null;
+            try {
+              if (defPart && defPart.length > 0) {
+                const ce = compileExpr(defPart);
+                if (ce && ce.code && ce.code.indexOf('__rt.evalSql') === -1) {
+                  jsExpr = ce.code;
+                }
+              } else {
+                jsExpr = 'null';
+              }
+            } catch (_) {}
+            env[vName] = {
+              kind: 'const_var',
+              sqlExpr: sqlExpr,
+              sqlType: rawType,
+              argIndices: argIndices,
+              jsExpr: jsExpr
+            };
+          }
+        }
+
+        if (!aMatchKw('BEGIN')) return null;
+
+        function combineConditions(c1, c2) {
+          if (!c1) return c2;
+          if (!c2) return c1;
+          const args = c1.argIndices.slice();
+          for (let i = 0; i < c2.argIndices.length; i++) {
+            if (args.indexOf(c2.argIndices[i]) === -1) args.push(c2.argIndices[i]);
+          }
+          return {
+            sql: '(' + c1.sql + ') AND (' + c2.sql + ')',
+            js: (c1.js && c2.js) ? ('__rt.and(' + c1.js + ', ' + c2.js + ')') : null,
+            argIndices: args
+          };
+        }
+
+        function negateCondition(c) {
+          return {
+            sql: 'NOT COALESCE((' + c.sql + '), false)',
+            js: c.js ? ('(!__rt.truthy(' + c.js + '))') : null,
+            argIndices: c.argIndices.slice()
+          };
+        }
+
+        function compileCondSlice(cSlice) {
+          const rw = rewriteSliceWithEnv(cSlice);
+          if (!rw || !rw.sql) return null;
+          let jsCode = null;
+          try {
+            const ce = compileExpr(cSlice);
+            if (ce && ce.code && ce.code.indexOf('__rt.evalSql') === -1) {
+              let code = ce.code;
+              let ok = true;
+              code = code.replace(/\b__v\d+_[a-zA-Z0-9_]+\b/g, function(m) {
+                for (const k in env) {
+                  if (env[k] && env[k].kind === 'const_var') {
+                    const rv = lookupVar(k);
+                    if (rv && rv.jsName === m) {
+                      if (env[k].jsExpr) return '(' + env[k].jsExpr + ')';
+                      ok = false;
+                    }
+                  }
+                }
+                ok = false;
+                return m;
+              });
+              if (ok) jsCode = code;
+            }
+          } catch (_) {}
+          return { sql: rw.sql, js: jsCode, argIndices: rw.argIndices };
+        }
+
+        const branches = [];
+        let terminated = false;
+
+        function parseInlinableStmts(stopKws, activeCond) {
+          while (ap < tokens.length) {
+            while (aPeek() && aPeek().type === 'directive') aNext();
+            const t = aPeek();
+            if (!t) break;
+            if (t.type === 'ident' && !t.quoted && stopKws[t.upper]) break;
+            if (t.value === ';') { aNext(); continue; }
+            if (terminated) return false;
+            if (t.type !== 'ident' || t.quoted) return false;
+
+            if (t.upper === 'NULL') {
+              aNext();
+              if (!aMatchVal(';')) return false;
+              continue;
+            }
+
+            if (t.upper === 'RETURN') {
+              aNext();
+              if (aMatchKw('QUERY')) {
+                if (aMatchKw('EXECUTE')) return false;
+                const qSlice = aCollectUntil(function(tk) { return tk.value === ';'; });
+                if (!aMatchVal(';')) return false;
+                if (qSlice.length === 0) return false;
+                const firstKw = (qSlice[0].type === 'ident' && !qSlice[0].quoted) ? qSlice[0].upper : '';
+                if (firstKw !== 'SELECT' && firstKw !== 'WITH' && firstKw !== 'VALUES' && firstKw !== 'TABLE' && qSlice[0].value !== '(') {
+                  return false;
+                }
+                for (let k = 0; k < qSlice.length; k++) {
+                  if (qSlice[k].type === 'ident' && !qSlice[k].quoted) {
+                    const u = qSlice[k].upper;
+                    if (u === 'INSERT' || u === 'UPDATE' || u === 'DELETE' || u === 'MERGE') return false;
+                  }
+                }
+                const rwQ = rewriteSliceWithEnv(qSlice);
+                if (!rwQ || !rwQ.sql) return false;
+                branches.push({ querySql: rwQ.sql, cond: activeCond });
+                continue;
+              }
+              if (aMatchVal(';')) {
+                if (!activeCond) {
+                  terminated = true;
+                  continue;
+                }
+                return false;
+              }
+              return false;
+            }
+
+            if (t.upper === 'IF') {
+              aNext();
+              const ifCondSlice = aCollectUntil(function(tk) { return tk.type === 'ident' && !tk.quoted && tk.upper === 'THEN'; });
+              if (!aMatchKw('THEN')) return false;
+              const cObj = compileCondSlice(ifCondSlice);
+              if (!cObj) return false;
+              const thenCond = combineConditions(activeCond, cObj);
+              if (!parseInlinableStmts({ ELSIF: 1, ELSEIF: 1, ELSE: 1, END: 1 }, thenCond)) return false;
+
+              let priorNeg = negateCondition(cObj);
+              while (aMatchKw('ELSIF') || aMatchKw('ELSEIF')) {
+                const elCondSlice = aCollectUntil(function(tk) { return tk.type === 'ident' && !tk.quoted && tk.upper === 'THEN'; });
+                if (!aMatchKw('THEN')) return false;
+                const elObj = compileCondSlice(elCondSlice);
+                if (!elObj) return false;
+                const branchCond = combineConditions(activeCond, combineConditions(priorNeg, elObj));
+                if (!parseInlinableStmts({ ELSIF: 1, ELSEIF: 1, ELSE: 1, END: 1 }, branchCond)) return false;
+                priorNeg = combineConditions(priorNeg, negateCondition(elObj));
+              }
+              if (aMatchKw('ELSE')) {
+                const elseCond = combineConditions(activeCond, priorNeg);
+                if (!parseInlinableStmts({ END: 1 }, elseCond)) return false;
+              }
+              if (!aMatchKw('END') || !aMatchKw('IF') || !aMatchVal(';')) return false;
+              continue;
+            }
+
+            if (t.upper === 'CASE') {
+              aNext();
+              let subjSlice = null;
+              if (!aPeek() || aPeek().upper !== 'WHEN') {
+                subjSlice = aCollectUntil(function(tk) { return tk.type === 'ident' && !tk.quoted && tk.upper === 'WHEN'; });
+                if (!subjSlice || subjSlice.length === 0) return false;
+              }
+              let priorNeg = null;
+              let sawWhen = false;
+              while (aMatchKw('WHEN')) {
+                sawWhen = true;
+                const wParts = [];
+                while (true) {
+                  const wSlice = aCollectUntil(function(tk) {
+                    return tk.value === ',' || (tk.type === 'ident' && !tk.quoted && tk.upper === 'THEN');
+                  });
+                  if (!wSlice || wSlice.length === 0) return false;
+                  const fullWhenSlice = subjSlice
+                    ? [{ type: 'punct', value: '(', pos: subjSlice[0].pos, end: subjSlice[0].pos }].concat(subjSlice).concat([
+                        { type: 'op', value: '=', pos: subjSlice[subjSlice.length - 1].end, end: subjSlice[subjSlice.length - 1].end }
+                      ]).concat(wSlice)
+                    : wSlice;
+                  let cPart;
+                  if (subjSlice) {
+                    const rwS = rewriteSliceWithEnv(subjSlice);
+                    const rwW = rewriteSliceWithEnv(wSlice);
+                    if (!rwS || !rwW) return false;
+                    const cSubj = compileCondSlice(subjSlice);
+                    const cWhen = compileCondSlice(wSlice);
+                    const args = rwS.argIndices.slice();
+                    for (let ai = 0; ai < rwW.argIndices.length; ai++) {
+                      if (args.indexOf(rwW.argIndices[ai]) === -1) args.push(rwW.argIndices[ai]);
+                    }
+                    cPart = {
+                      sql: '(' + rwS.sql + ') = (' + rwW.sql + ')',
+                      js: (cSubj && cSubj.js && cWhen && cWhen.js) ? ('__rt.eq(' + cSubj.js + ', ' + cWhen.js + ')') : null,
+                      argIndices: args
+                    };
+                  } else {
+                    cPart = compileCondSlice(wSlice);
+                  }
+                  if (!cPart) return false;
+                  wParts.push(cPart);
+                  if (aMatchVal(',')) continue;
+                  break;
+                }
+                if (!aMatchKw('THEN')) return false;
+                let wCombined = wParts[0];
+                for (let wi = 1; wi < wParts.length; wi++) {
+                  const p2 = wParts[wi];
+                  const args = wCombined.argIndices.slice();
+                  for (let ai = 0; ai < p2.argIndices.length; ai++) {
+                    if (args.indexOf(p2.argIndices[ai]) === -1) args.push(p2.argIndices[ai]);
+                  }
+                  wCombined = {
+                    sql: '(' + wCombined.sql + ') OR (' + p2.sql + ')',
+                    js: (wCombined.js && p2.js) ? ('__rt.or(' + wCombined.js + ', ' + p2.js + ')') : null,
+                    argIndices: args
+                  };
+                }
+                const branchCond = combineConditions(activeCond, combineConditions(priorNeg, wCombined));
+                if (!parseInlinableStmts({ WHEN: 1, ELSE: 1, END: 1 }, branchCond)) return false;
+                priorNeg = combineConditions(priorNeg, negateCondition(wCombined));
+              }
+              if (!sawWhen) return false;
+              if (aMatchKw('ELSE')) {
+                const elseCond = combineConditions(activeCond, priorNeg);
+                if (!parseInlinableStmts({ END: 1 }, elseCond)) return false;
+              }
+              if (!aMatchKw('END') || !aMatchKw('CASE') || !aMatchVal(';')) return false;
+              continue;
+            }
+
+            return false;
+          }
+          return true;
+        }
+
+        if (!parseInlinableStmts({ END: 1, EXCEPTION: 1 }, null)) return null;
+        if (!aMatchKw('END')) return null;
+        if (aPeek() && aPeek().type === 'ident' && aPeek().value !== ';') aNext();
+        aMatchVal(';');
+        while (aPeek() && aPeek().type === 'directive') aNext();
+        if (ap < tokens.length) return null;
+        if (branches.length === 0) return null;
+
+        return {
+          fn_oid: procInfo.fn_oid,
+          proname: procInfo.proname,
+          provolatile: procInfo.provolatile,
+          rettype_sql: procInfo.rettype_sql,
+          rettype_typtype: procInfo.rettype_typtype,
+          isScalarSrf: isScalarSrf,
+          inArgs: procInfo.inArgs,
+          tableArgs: procInfo.tableArgs,
+          outArgs: procInfo.outArgs,
+          branches: branches
+        };
+      }
+
+      if (procInfo.proretset && procInfo.fn_oid > 0) {
+        const inlineDesc = analyzeInlinableSrf();
+        if (inlineDesc) {
+          globalThis.__plpgsql_v8_inline_registry[String(procInfo.fn_oid)] = inlineDesc;
+          if (typeof pg.set_function_support === 'function') {
+            try { pg.set_function_support(procInfo.fn_oid); } catch (_) {}
+          }
+        } else {
+          delete globalThis.__plpgsql_v8_inline_registry[String(procInfo.fn_oid)];
+        }
+      }
+
+      if (fnCacheKey) {
+        globalThis.__plpgsql_v8_fn_cache[fnCacheKey] = {
+          js: fullJs,
+          proretset: Boolean(procInfo.proretset && globalThis.__plpgsql_v8_inline_registry[String(procInfo.fn_oid)])
+        };
+      }
+
       return fullJs;
     }
+
+    function buildInlinedSrfSql(desc, req) {
+      const rt = ensureRuntime();
+      const pg = rt.pg();
+      if (!desc || !Array.isArray(desc.branches) || desc.branches.length === 0) return null;
+
+      if (desc.provolatile === 'v') {
+        let allowVolatile = true;
+        if (typeof pg.current_setting === 'function') {
+          const val = pg.current_setting('plpgsql_v8.inline_volatile_srf', true);
+          if (val !== null && val !== undefined && String(val).trim() !== '') {
+            const low = String(val).trim().toLowerCase();
+            if (low === 'off' || low === 'false' || low === 'no' || low === '0') {
+              allowVolatile = false;
+            }
+          }
+        }
+        if (!allowVolatile) return null;
+      }
+
+      const callArgs = (req && Array.isArray(req.call_args)) ? req.call_args : [];
+      const activeBranches = [];
+
+      for (let i = 0; i < desc.branches.length; i++) {
+        const br = desc.branches[i];
+        if (!br.cond) {
+          activeBranches.push({ querySql: br.querySql, condSql: null });
+          continue;
+        }
+        const cond = br.cond;
+        let canConstEval = Boolean(cond.js);
+        if (canConstEval && Array.isArray(cond.argIndices)) {
+          for (let a = 0; a < cond.argIndices.length; a++) {
+            const idx = cond.argIndices[a];
+            if (!callArgs[idx] || !callArgs[idx].is_const) {
+              canConstEval = false;
+              break;
+            }
+          }
+        }
+        if (canConstEval) {
+          try {
+            const argVals = [];
+            for (let a = 0; a < desc.inArgs.length; a++) {
+              const ca = callArgs[a];
+              if (!ca || ca.is_null) {
+                argVals.push(null);
+              } else {
+                const rawVal = (ca.const_val !== undefined) ? ca.const_val : ca.value;
+                const inArg = desc.inArgs[a];
+                argVals.push((inArg && inArg.sqlType) ? rt.coerce(rawVal, inArg.sqlType, false, null) : rawVal);
+              }
+            }
+            const evalLines = ['const __rt = globalThis.__plpgsql_v8_rt;'];
+            for (let a = 0; a < desc.inArgs.length; a++) {
+              evalLines.push('const __arg_' + (a + 1) + ' = arguments[' + a + '];');
+            }
+            evalLines.push('return __rt.truthy(' + cond.js + ');');
+            const fn = new Function(evalLines.join('\n'));
+            const taken = fn.apply(null, argVals);
+            if (taken) {
+              activeBranches.push({ querySql: br.querySql, condSql: null });
+            }
+            continue;
+          } catch (_) {}
+        }
+        activeBranches.push({ querySql: br.querySql, condSql: cond.sql });
+      }
+
+      let combinedSql = '';
+      if (activeBranches.length === 0) {
+        const firstSql = desc.branches[0].querySql;
+        combinedSql = 'SELECT * FROM (' + firstSql + ') AS __rq_empty WHERE false';
+      } else if (activeBranches.length === 1 && !activeBranches[0].condSql) {
+        combinedSql = activeBranches[0].querySql;
+      } else {
+        const parts = [];
+        for (let i = 0; i < activeBranches.length; i++) {
+          const ab = activeBranches[i];
+          if (ab.condSql) {
+            parts.push('SELECT * FROM (' + ab.querySql + ') AS __rq_br_' + i + ' WHERE (' + ab.condSql + ')');
+          } else {
+            parts.push('SELECT * FROM (' + ab.querySql + ') AS __rq_br_' + i);
+          }
+        }
+        combinedSql = parts.join(' UNION ALL ');
+      }
+
+      return {
+        sql: combinedSql,
+        pass_call_args: (desc.inArgs.length > 0)
+      };
+    }
+
+    (function registerPlpgsqlSupport() {
+      const rt = ensureRuntime();
+      const pg = rt.pg();
+      if (typeof pg.register_support !== 'function') return;
+      const supportCb = function(req) {
+        if (!req || (req.request_type !== 'simplify' && req.request_type !== 'SupportRequestSimplify')) return null;
+        const rawOid = (req.func_oid !== undefined) ? req.func_oid : req.funcid;
+        const fnOid = rawOid ? Number(rawOid) : 0;
+        if (!fnOid) return null;
+        let desc = globalThis.__plpgsql_v8_inline_registry && globalThis.__plpgsql_v8_inline_registry[String(fnOid)];
+        if (!desc) {
+          try {
+            const rows = rt.execSql("SELECT prosrc, proname FROM pg_catalog.pg_proc WHERE oid = $1::oid", [fnOid], true);
+            if (rows && rows.length > 0) {
+              compilePlpgsql(rows[0].prosrc, { fn_oid: fnOid, proname: rows[0].proname });
+              desc = globalThis.__plpgsql_v8_inline_registry && globalThis.__plpgsql_v8_inline_registry[String(fnOid)];
+            }
+          } catch (_) {}
+        }
+        if (!desc) return null;
+        return buildInlinedSrfSql(desc, req);
+      };
+      try { pg.register_support('plpgsql_v8', supportCb); } catch (_) {}
+      try { pg.register_support('pl_pgsql_v8', supportCb); } catch (_) {}
+      try { pg.register_support('pl/pgsql+v8', supportCb); } catch (_) {}
+      try { pg.register_support('pl_pgsql_v8', supportCb); } catch (_) {}
+    })();
 
     return compilePlpgsql;
   })();
 }
 return globalThis.__plpgsql_v8_compile(arguments[0], arguments[1]);
-$plpgsql_v8_Compiler$ LANGUAGE plv8;
-REVOKE ALL ON FUNCTION plv8_plpgsql_handler() FROM PUBLIC;
-
-DO $plpgsql_v8_schema_helper$
-BEGIN
-  IF pg_catalog.to_regnamespace('plv8') IS NOT NULL AND pg_catalog.has_schema_privilege('plv8', 'CREATE') THEN
-    EXECUTE $ddl$
-      CREATE OR REPLACE FUNCTION plv8.compile_plpgsql(src text, meta jsonb DEFAULT NULL)
-      RETURNS text AS
-      $plpgsql_v8_CompileHelper$
-        const __pg = (typeof plv8 !== 'undefined') ? plv8 : pljs;
-        if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
-          const rows = __pg.execute("SELECT prosrc FROM pg_catalog.pg_proc WHERE oid = 'plv8_plpgsql_handler()'::regprocedure");
-          const initFn = new Function(rows[0].prosrc);
-          initFn.call(globalThis, 'BEGIN RETURN; END;', {});
-        }
-        return globalThis.__plpgsql_v8_compile(src, meta || {});
-      $plpgsql_v8_CompileHelper$ LANGUAGE plv8;
-      REVOKE ALL ON FUNCTION plv8.compile_plpgsql(text, jsonb) FROM PUBLIC;
-    $ddl$;
-  END IF;
-END;
-$plpgsql_v8_schema_helper$ LANGUAGE plpgsql;
-
-CREATE OR REPLACE FUNCTION compile_plpgsql(src text, meta jsonb DEFAULT NULL)
-RETURNS text AS
-$plpgsql_v8_CompileHelper_Unqual$
+$plpgsql_v8_Compiler$;
+  v_helper_src text := $plpgsql_v8_CompileHelper$
   const __pg = (typeof plv8 !== 'undefined') ? plv8 : pljs;
   if (typeof globalThis.__plpgsql_v8_compile !== 'function') {
     const rows = __pg.execute("SELECT prosrc FROM pg_catalog.pg_proc WHERE oid = 'plv8_plpgsql_handler()'::regprocedure");
@@ -4211,22 +5217,70 @@ $plpgsql_v8_CompileHelper_Unqual$
     initFn.call(globalThis, 'BEGIN RETURN; END;', {});
   }
   return globalThis.__plpgsql_v8_compile(src, meta || {});
-$plpgsql_v8_CompileHelper_Unqual$ LANGUAGE plv8;
-REVOKE ALL ON FUNCTION compile_plpgsql(text, jsonb) FROM PUBLIC;
+$plpgsql_v8_CompileHelper$;
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_language WHERE lanname = 'plv8') THEN
+    v_lang := 'plv8';
+    v_inline := 'plv8_inline_handler';
+    v_validator := 'plv8_call_validator';
+  ELSIF EXISTS (SELECT 1 FROM pg_catalog.pg_language WHERE lanname = 'pljs') THEN
+    v_lang := 'pljs';
+    v_inline := 'pljs_inline_handler';
+    v_validator := 'pljs_call_validator';
+    IF pg_catalog.to_regnamespace('plv8') IS NULL THEN
+      EXECUTE 'CREATE SCHEMA IF NOT EXISTS plv8';
+      EXECUTE 'GRANT USAGE ON SCHEMA plv8 TO PUBLIC';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_language WHERE lanname = 'plv8') THEN
+      EXECUTE 'CREATE OR REPLACE FUNCTION plv8_js_passthrough_handler() RETURNS language_handler AS $js$ if (typeof globalThis.plv8 === "undefined" && typeof globalThis.pljs !== "undefined") { globalThis.plv8 = globalThis.pljs; } return arguments[0]; $js$ LANGUAGE pljs';
+      EXECUTE 'REVOKE ALL ON FUNCTION plv8_js_passthrough_handler() FROM PUBLIC';
+      EXECUTE 'CREATE OR REPLACE TRUSTED LANGUAGE plv8 HANDLER plv8_js_passthrough_handler INLINE pljs_inline_handler VALIDATOR pljs_call_validator';
+    END IF;
+  ELSE
+    RAISE EXCEPTION 'pl_pgsql_v8 requires either plv8 or pljs extension to be installed';
+  END IF;
 
-CREATE OR REPLACE TRUSTED LANGUAGE pl_pgsql_v8
-	HANDLER plv8_plpgsql_handler
-	INLINE plv8_inline_handler
-	VALIDATOR plv8_call_validator;
+  EXECUTE pg_catalog.format(
+    'CREATE OR REPLACE FUNCTION plv8_plpgsql_handler() RETURNS language_handler AS %L LANGUAGE %I',
+    v_compiler_src, v_lang
+  );
+  EXECUTE 'REVOKE ALL ON FUNCTION plv8_plpgsql_handler() FROM PUBLIC';
 
-CREATE OR REPLACE TRUSTED LANGUAGE plpgsql_v8
-	HANDLER plv8_plpgsql_handler
-	INLINE plv8_inline_handler
-	VALIDATOR plv8_call_validator;
+  IF pg_catalog.to_regnamespace('plv8') IS NOT NULL AND pg_catalog.has_schema_privilege('plv8', 'CREATE') THEN
+    EXECUTE pg_catalog.format(
+      'CREATE OR REPLACE FUNCTION plv8.compile_plpgsql(src text, meta jsonb DEFAULT NULL) RETURNS text AS %L LANGUAGE %I',
+      v_helper_src, v_lang
+    );
+    EXECUTE 'REVOKE ALL ON FUNCTION plv8.compile_plpgsql(text, jsonb) FROM PUBLIC';
+  END IF;
 
-CREATE OR REPLACE TRUSTED LANGUAGE "pl/pgsql+v8"
-	HANDLER plv8_plpgsql_handler
-	INLINE plv8_inline_handler
-	VALIDATOR plv8_call_validator;
+  IF pg_catalog.to_regnamespace('pljs') IS NOT NULL AND pg_catalog.has_schema_privilege('pljs', 'CREATE') THEN
+    EXECUTE pg_catalog.format(
+      'CREATE OR REPLACE FUNCTION pljs.compile_plpgsql(src text, meta jsonb DEFAULT NULL) RETURNS text AS %L LANGUAGE %I',
+      v_helper_src, v_lang
+    );
+    EXECUTE 'REVOKE ALL ON FUNCTION pljs.compile_plpgsql(text, jsonb) FROM PUBLIC';
+  END IF;
+
+  EXECUTE pg_catalog.format(
+    'CREATE OR REPLACE FUNCTION compile_plpgsql(src text, meta jsonb DEFAULT NULL) RETURNS text AS %L LANGUAGE %I',
+    v_helper_src, v_lang
+  );
+  EXECUTE 'REVOKE ALL ON FUNCTION compile_plpgsql(text, jsonb) FROM PUBLIC';
+
+  EXECUTE pg_catalog.format(
+    'CREATE OR REPLACE TRUSTED LANGUAGE pl_pgsql_v8 HANDLER plv8_plpgsql_handler INLINE %I VALIDATOR %I',
+    v_inline, v_validator
+  );
+  EXECUTE pg_catalog.format(
+    'CREATE OR REPLACE TRUSTED LANGUAGE plpgsql_v8 HANDLER plv8_plpgsql_handler INLINE %I VALIDATOR %I',
+    v_inline, v_validator
+  );
+  EXECUTE pg_catalog.format(
+    'CREATE OR REPLACE TRUSTED LANGUAGE "pl/pgsql+v8" HANDLER plv8_plpgsql_handler INLINE %I VALIDATOR %I',
+    v_inline, v_validator
+  );
+END;
+$plpgsql_v8_bootstrap$ LANGUAGE plpgsql;
 $tle_pkg_pl_pgsql_v8$
 );

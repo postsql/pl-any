@@ -17,6 +17,9 @@
     - [5.2 Opt-In Raw Byte Passing (`pass_user_types_as_bytes`)](#52-opt-in-raw-byte-passing-pass_user_types_as_bytes)
     - [5.3 Rich PostgreSQL Error Diagnostics Across Subtransactions](#53-rich-postgresql-error-diagnostics-across-subtransactions)
     - [5.4 Subtransaction Safety Across SPI Prepare, Plan, and Cursor Operations](#54-subtransaction-safety-across-spi-prepare-plan-and-cursor-operations)
+    - [5.5 Planner Support Hook (`plv8_call_support` / `pljs_call_support`) & `meta.support_func`](#55-planner-support-hook-plv8_call_support--pljs_call_support--metasupport_func)
+    - [5.6 Direct C/C++ SPI-to-Tuplestore Streaming (`plan.return_query` & `plv8.return_query`)](#56-direct-cc-spi-to-tuplestore-streaming-planreturn_query--plv8return_query)
+    - [5.7 Exact `NUMERIC` Precision (`meta.preserve_numeric_precision`) & Zero-SPI `pg.current_setting`](#57-exact-numeric-precision-metapreserve_numeric_precision--zero-spi-pgcurrent_setting)
   - [6. Lexical Analysis (`tokenize`)](#6-lexical-analysis-tokenize)
   - [7. Catalog Introspection & Lexical Scope Architecture](#7-catalog-introspection--lexical-scope-architecture)
     - [7.1 Catalog Metadata Resolution](#71-catalog-metadata-resolution)
@@ -216,6 +219,42 @@ In `plv8_func.cc`, `SubTranBlock` protection was added around:
 
 This guarantees that any SQL error during plan preparation, execution, or cursor manipulation can be cleanly trapped by `BEGIN ... EXCEPTION WHEN ... END` in `plpgsql_v8`.
 
+### 5.5 Planner Support Hook (`plv8_call_support` / `pljs_call_support`) & `meta.support_func`
+
+Both `plv8` (`plv8.cc`) and `pljs` (`src/pljs.c`) expose a PostgreSQL `INTERNAL` planner support function (`plv8_call_support` / `pljs_call_support`):
+1. **Validator Registration (`meta.support_func`)**:
+   - When `plv8_transpile_src` / `pljs_transpile_src` runs during `CREATE FUNCTION` validation (`is_validate == true`), it inspects `meta.support_func`.
+   - If the language handler sets `meta.support_func = "plv8_call_support"` (or `"pljs_call_support"`), the validator updates the function's `pg_proc.prosupport` column via `heap_modify_tuple` + `CatalogTupleUpdate` (when `prosupport` is not already set).
+   - If an `ALTER` or `CREATE OR REPLACE` modifies a previously inlined SRF so that it is no longer inlineable (`meta.support_func` is not set) while `prosupport` currently points to `plv8_call_support` / `pljs_call_support`, the validator resets `prosupport = InvalidOid`.
+2. **Handling `SupportRequestSimplify` and `SupportRequestInlineInFrom`**:
+   - When PostgreSQL's planner simplifies a `FuncExpr` or inlines a `RangeTblFunction` in `FROM` (`function_selectivity` / `simplify_function` / `inline_set_returning_function`), `plv8_call_support` / `pljs_call_support` looks up `globalThis.__plv8_support_handlers[func_oid]`.
+   - If not yet registered in the current isolate (e.g., on a fresh backend connection where the function was created in a prior session), it triggers `plv8_get_proc(funcid, NULL, false, &proname)` to run the language transpiler and populate `__plv8_support_handlers[func_oid]`.
+   - It builds a JS request object `{ request_type: "simplify", func_oid, nargs, call_args: [{ index, is_const, type_oid, type_sql, const_val }], expected_columns: [{ name, type_oid, type_sql }] }` and calls the registered JS support callback.
+   - When the callback returns `{ sql: "SELECT ..." }`, C/C++ synthesizes an ephemeral `FuncExpr` with `prolang = SQLlanguageId` and `prosrc = sql` and delegates to PostgreSQL's native `inline_function` / `inline_set_returning_function` (using `copyObjectImpl` to preserve caller argument expressions), splicing the parsed and rewritten SQL `Query` tree directly into the outer plan!
+
+### 5.6 Direct C/C++ SPI-to-Tuplestore Streaming (`plan.return_query` & `plv8.return_query`)
+
+To eliminate row-by-row V8/QuickJS object allocation when executing non-inlined `RETURN QUERY` and `RETURN QUERY EXECUTE` statements:
+1. **`plv8_stream_spi_to_tuplestore` (`plv8_func.cc`) & `pljs_return_query_spi_result` (`src/functions.c`)**:
+   - Inspects `SPI_tuptable->tupdesc` against the SRF's `CurrentConversion->tupdesc` and writes all `SPI_processed` tuples directly into `CurrentConversion->tupstore` in C/C++, returning only `SPI_processed` as an integer to JS.
+2. **Whole-Tuple Fast Path (`all_same_type`)**:
+   - Pre-checks before the row loop whether `out_natts <= spi_tupdesc->natts`, neither descriptor has dropped columns, and every output column's `atttypid` matches the SPI column's `atttypid`.
+   - When `all_same_type` is true and `out_natts == spi_tupdesc->natts`, each `SPI_tuptable->vals[i]` is appended directly via `tuplestore_puttuple(tupstore, SPI_tuptable->vals[i])` with zero per-column extraction!
+3. **Strict PL/pgSQL Structure Verification (`strict = true` -> SQLSTATE `42804`)**:
+   - Both `plv8.return_query(sql[, args[, strict]])` and `plan.return_query([args[, strict]])` accept an optional boolean `strict` parameter (`true` when emitted by `plpgsql_v8`).
+   - When `strict` is `true`, if the count of non-dropped columns in `SPI_tuptable->tupdesc` does not equal the count of non-dropped columns in `CurrentConversion->tupdesc`, or if any column's `atttypid` neither matches `out_type` nor satisfies `IsBinaryCoercible(spi_type, out_type)`, C/C++ raises `ERRCODE_DATATYPE_MISMATCH` (`42804`: `"structure of query does not match function result type"`), matching native PL/pgSQL's `RETURN QUERY` behavior.
+
+### 5.7 Exact `NUMERIC` Precision (`meta.preserve_numeric_precision`) & Zero-SPI `pg.current_setting`
+
+1. **`meta.preserve_numeric_precision`**:
+   - In standard `plv8`/`pljs`, `NUMERICOID` values are converted via `DatumGetFloat8(DirectFunctionCall1(numeric_float8, ...))`, which loses precision beyond 15–17 significant decimal digits.
+   - `plv8` (`plv8_proc_cache::preserve_numeric_precision` / `PreserveNumericPrecisionScope`) and `pljs` (`pljs_cache_entry::preserve_numeric_precision` / `pljs_preserve_numeric_precision`) now check `meta.preserve_numeric_precision` after running a language handler.
+   - When `true` (enabled by `plpgsql_v8`), `ToValue` for `NUMERICOID` calls `DatumGetCString(DirectFunctionCall1(numeric_out, datum))` and counts significant digits: if the value has $> 15$ significant digits or exceeds safe `double` range, it is returned to JS as an exact decimal `String` (while `ToScalarDatum` parses JS strings for `NUMERICOID` via `numeric_in`).
+2. **Zero-SPI `pg.current_setting(name[, missing_ok])`**:
+   - Both `plv8` and `pljs` expose `current_setting(name[, missing_ok])` backed directly by PostgreSQL's C `GetConfigOptionByName(name, NULL, missing_ok)` so GUCs such as `plpgsql_v8.inline_volatile_srf` can be read in nanoseconds without SPI overhead.
+3. **Catalog Invalidation Counter (`pg.proc_cache_key`)**:
+   - Calling `pg.proc_cache_key('*')` returns a monotonically increasing catalog invalidation counter (`plv8_catalog_InvalidateCounter` / `pljs_catalog_invalidation_counter` incremented by a `PROCOID` syscache callback), enabling O(1) cache invalidation for JS-level caches (`__plpgsql_v8_fn_cache`, `rt._typeCache`, `rt._planCache`).
+
 ---
 
 ## 6. Lexical Analysis (`tokenize`)
@@ -239,15 +278,15 @@ Comments (`-- ...` single-line and nested `/* ... */` block comments) are skippe
 
 ## 7. Catalog Introspection & Lexical Scope Architecture
 
-### 7.1 Catalog Metadata Resolution
+### 7.1 Catalog Metadata Resolution & Caching
 
-At the beginning of `compilePlpgsql(src, meta)` (`plv8.sql.common`, lines 1338–1461):
-- If `meta.fn_oid` is provided, the compiler queries `pg_catalog.pg_proc` joined with `pg_catalog.pg_type` to retrieve:
-  - `proname`, `proretset`, `prokind` (`'f'` function vs `'p'` procedure), `prorettype`, `rettypname`, `rettypcategory`, `rettyprelid`.
+At the beginning of `compilePlpgsql(src, meta)`:
+- If `meta.fn_oid` is provided, the compiler queries `pg_catalog.pg_proc` joined with `pg_catalog.pg_type` (using a cached prepared plan `_fnMetaPlan` and caching the resolved signature in `globalThis.__plpgsql_v8_fn_cache` keyed by `${fnOid}:${pg.proc_cache_key(fnOid)}`) to retrieve:
+  - `proname`, `proretset`, `prokind` (`'f'` function vs `'p'` procedure), `provolatile` (`'i'`, `'s'`, `'v'`), `prorettype`, `rettypname`, `rettypcategory`, `rettyprelid`.
   - `proargtypes`, `proallargtypes`, `proargmodes` (`'i'`, `'o'`, `'b'`, `'v'`, `'t'`), `proargnames`.
-- Helper functions query `pg_catalog.pg_attribute`, `pg_catalog.pg_class`, and `pg_catalog.pg_type` on demand during compilation:
-  - `resolveRowFields(typeName)` (lines 1409–1445): Resolves `schema.table%ROWTYPE` or composite type names to their column names and SQL types (`{ name, type }`).
-  - `resolvePercentType(typeSpec)` (lines 1447–1461): Resolves `var%TYPE` (from in-scope variables) or `table.col%TYPE` / `schema.table.col%TYPE` via `format_type(a.atttypid, a.atttypmod)`.
+- Helper functions query `pg_catalog.pg_attribute`, `pg_catalog.pg_class`, and `pg_catalog.pg_type` on demand during compilation and cache their results in `rt._typeCache` (invalidated automatically when `pg.proc_cache_key('*')` changes):
+  - `resolveRowFields(typeName)`: Resolves `schema.table%ROWTYPE` or composite type names to their column names and SQL types (`{ name, type }`).
+  - `resolvePercentType(typeSpec)`: Resolves `var%TYPE` (from in-scope variables) or `table.col%TYPE` / `schema.table.col%TYPE` via `format_type(a.atttypid, a.atttypmod)`.
 
 ### 7.2 Scope Stack, Labels, and Variable Naming
 
@@ -355,14 +394,19 @@ JavaScript's `&&`, `||`, `!`, `===`, and `<` operators do not follow SQL's three
 - String concatenation (`__rt.concat(a, b)` for `||`):
   - If either operand is `null`, returns `null` (unless both operands are `Array` instances, in which case `||` performs PostgreSQL array concatenation).
 
-### 8.4 64-Bit `BigInt` Arithmetic & Static Integer vs Float Division
+### 8.4 64-Bit `BigInt` Arithmetic, Exact `NUMERIC` Decimal Arithmetic & Static Integer vs Float Division
 
-PostgreSQL `bigint` (`int8`) values exceed `Number.MAX_SAFE_INTEGER` ($2^{53} - 1$) and are represented in V8 as `BigInt` when outside safe integer bounds (or returned by `plv8` as `BigInt` / `Number`).
-- `__rt.add`, `__rt.sub`, `__rt.mul`, `__rt.idiv`, and `__rt.mod` automatically promote operands to `BigInt` whenever either operand is a `BigInt` or when a safe-integer operation would overflow `Number.isSafeInteger(res)`.
-- `__rt.normBigInt(v)` converts a `BigInt` back to a JS `Number` if it fits within `[-9007199254740991, 9007199254740991]` so standard JSON/SPI marshaling works seamlessly, while keeping larger 64-bit integers as `BigInt`.
+PostgreSQL `bigint` (`int8`) values exceed `Number.MAX_SAFE_INTEGER` ($2^{53} - 1$) and are represented in JavaScript as `BigInt` when outside safe integer bounds (or returned by `plv8`/`pljs` as `BigInt` / `Number`). Furthermore, `NUMERIC` (`decimal`) values can have up to 131,072 digits before the decimal point and 16,383 digits after the decimal point.
+- **64-Bit `BigInt` Promotion**:
+  - `__rt.add`, `__rt.sub`, `__rt.mul`, `__rt.idiv`, and `__rt.mod` automatically promote operands to `BigInt` whenever either operand is a `BigInt` or when a safe-integer operation would overflow `Number.isSafeInteger(res)`.
+  - `__rt.normBigInt(v)` converts a `BigInt` back to a JS `Number` if it fits within `[-9007199254740991, 9007199254740991]` so standard JSON/SPI marshaling works seamlessly, while keeping larger 64-bit integers as `BigInt`.
+- **Exact `BigInt`-Scaled Decimal Arithmetic (`parseDecParts` / `formatDecParts`)**:
+  - When `meta.preserve_numeric_precision = true`, `NUMERIC` values with $> 15$ significant digits are passed into JS as decimal strings (and `NUMERIC` literals in PL/pgSQL source with $> 15$ significant digits are emitted as string literals in `parsePrimary`).
+  - Whenever `__rt.add`, `__rt.sub`, `__rt.mul`, `__rt.uminus`, or `__rt.cmpVal` encounters a decimal string (`isDecStr`, supporting both standard `[+-]?digits.digits` and scientific notation `[eE][+-]?exp`), `parseDecParts(s)` decomposes both operands into `{ unscaled: BigInt, scale: Number }`, aligns their decimal scales using `10n ** BigInt(scaleDiff)`, performs exact `BigInt` addition, subtraction, multiplication, or comparison, and formats the result back via `formatDecParts(unscaled, scale)` with zero precision loss.
+  - `__rt.coerce(val, 'numeric(p, s)')` enforces explicit `numeric(precision, scale)` rounding (half-away-from-zero) and overflow checks (`22003`) using exact `BigInt` scaling.
 - **Integer vs Float Division (`/` operator)**:
   - In SQL/PL/pgSQL, `10 / 3` is integer division (`3`) when both operands have integer types (`smallint`, `integer`, `bigint`), whereas `10.0 / 3` is floating-point division (`3.3333...`).
-  - Because JS represents both `10` and `10.0` as `Number(10)` at runtime, `compileExpr` tracks static expression types (`{ code, type }`) and checks `isIntType(l.type) && isIntType(r.type)` (`plv8.sql.common`, lines 1555–1559, 2165).
+  - Because JS represents both `10` and `10.0` as `Number(10)` at runtime, `compileExpr` tracks static expression types (`{ code, type }`) and checks `isIntType(l.type) && isIntType(r.type)`.
   - When both the left and right operands of `/` are statically integer-typed, the compiler emits `__rt.idiv(l, r)` (`Math.trunc(na / nb)` or `BigInt` division); otherwise it emits `__rt.div(l, r)`.
   - Both `__rt.idiv` and `__rt.div` raise SQLSTATE `22012` (`division by zero`) if the divisor is `0`.
 
@@ -497,16 +541,24 @@ In `plpgsql_v8` (`lines 944–1027`, `3947–4122`):
 - `__rt.fetchCursor(curObj, dir, count)` and `__rt.moveCursor(curObj, dir, count)` implement `NEXT`, `PRIOR`, `FIRST`, `LAST`, `ABSOLUTE n`, `RELATIVE n`, `FORWARD [n | ALL]`, `BACKWARD [n | ALL]`, and bare count `n`, updating `FOUND` (`__found`) and `ROW_COUNT` (`__row_count`).
 - `__rt.closeCursor(curObj)` closes both `curObj.portal` and `curObj.plan`. Cursor `FOR` loops automatically close their cursor in a `finally` block.
 
-### 11.2 Set-Returning Functions (`RETURN NEXT`, `RETURN QUERY`, `RETURNS TABLE`)
+### 11.2 Set-Returning Functions (`RETURN NEXT`, `RETURN QUERY`, `RETURNS TABLE`, and Outer-Plan Inlining)
 
-When `retset` is `true` (`parseReturnStmt`, lines 3587–3657):
+When `retset` is `true`:
 - **`RETURN NEXT [expr]`**:
   - If the function uses `RETURNS TABLE(c1 t1, c2 t2)` or has `OUT` parameters and no expression is passed, `RETURN NEXT;` packages the current values of the output variables and passes them to `__pg.return_next(...)`.
   - If an expression is given (`RETURN NEXT expr;`), it coerces and passes that expression to `__pg.return_next(...)`.
-- **`RETURN QUERY <static_sql>` and `RETURN QUERY EXECUTE <dyn_sql> [USING ...]`**:
-  - Compiles to `__rt.returnQuery(sql, params, isScalarSrf, outColNames)` and updates `__last_row_count` (`GET DIAGNOSTICS ... = ROW_COUNT`) and `__found` (`FOUND`).
-  - When `plv8.return_query(sql, params)` is available in C++, `__rt.returnQuery` executes the query via SPI and streams all result rows directly from `SPI_tuptable` into the function's active SRF `Tuplestorestate` (`tupstore`) in C++ with positional column matching and C-level type coercion—bypassing V8 JavaScript row materialization entirely.
-  - Falls back to `__pg.execute(sql, params)` + `__rt.returnNext(...)` if `plv8.return_query` is not present.
+- **Planner-Level Outer-Plan `RETURN QUERY` Inlining (`extractSrfInlineSpec`, `buildInlinedSrfSql`, `registerPlpgsqlSupport`)**:
+  - During `compilePlpgsql`, if `retset && !isProcedure && !isTrigger`, `extractSrfInlineSpec()` analyzes the function's AST.
+  - A set-returning function is eligible for outer-plan inlining when it declares no local variables (other than `ALIAS FOR $n` parameter aliases), has no `EXCEPTION` blocks, and its body consists solely of:
+    1. `RETURN QUERY <static_sql>;` (where `<static_sql>` is a `SELECT` or `WITH ... SELECT` without DML keywords),
+    2. Empty `RETURN;`, or
+    3. `IF ... THEN ... ELSIF ... THEN ... ELSE ... END IF` / `CASE ... WHEN ... END CASE` statements whose branches recursively contain only `RETURN QUERY` or empty `RETURN;` and whose conditions reference only function input parameters (`$1..$N` or parameter names/aliases).
+  - For eligible SRFs, `compilePlpgsql` sets `meta.support_func = (typeof plv8 !== 'undefined') ? 'plv8_call_support' : 'pljs_call_support'` and registers a per-function callback in `globalThis.__plv8_support_handlers[fnOid]`.
+  - When PostgreSQL plans a query calling the SRF, `buildInlinedSrfSql(spec, req)` checks `plpgsql_v8.inline_volatile_srf` (via `pg.current_setting('plpgsql_v8.inline_volatile_srf', true)`), evaluates any constant-argument `IF`/`CASE` branch conditions (`evalConstCondSql`) to prune dead branches at plan time, wraps runtime `IF`/`CASE` branch conditions with `WHERE (<cond>)` `One-Time Filter` guards, joins multiple `RETURN QUERY` branches with `UNION ALL`, projects output columns to the exact declared `RETURNS TABLE` / `RETURNS SETOF` / caller `AS (...)` column types, and returns `{ sql }` to `plv8_call_support` / `pljs_call_support`.
+- **Direct C/C++ SPI-to-Tuplestore Streaming (`RETURN QUERY <static_sql>` and `RETURN QUERY EXECUTE <dyn_sql> [USING ...]`)**:
+  - When a set-returning function is not inlined (e.g., it mixes `RETURN QUERY` with procedural loops or `RETURN NEXT`), `RETURN QUERY` compiles to `__rt.returnQuery(sql, params, isScalarSrf, outColNames, isDynamic)` and updates `__row_count` (`GET DIAGNOSTICS ... = ROW_COUNT`) and `__found` (`FOUND`).
+  - For static queries (`!isDynamic`), `__rt.returnQuery` prepares and caches the SPI plan in `rt._planCache` and calls `plan.return_query(params, true)`, streaming all result tuples directly from `SPI_tuptable` into the SRF's `Tuplestorestate` (`tupstore`) in C/C++ (using the whole-tuple `tuplestore_puttuple` fast path when column types match) and enforcing strict PL/pgSQL column count and type verification (`42804`).
+  - For dynamic queries (`isDynamic`), `__rt.returnQuery` calls `__pg.return_query(sql, params, true)`.
 
 ### 11.3 Stored Procedures (`OUT`/`INOUT` and Transaction Control)
 
@@ -853,3 +905,5 @@ The test suite in `third_party/pgext/plv8/sql/plpgsql_v8.sql` (`lines 1–996`, 
    - `BEFORE INSERT OR UPDATE` and `AFTER DELETE` triggers using `NEW`, `OLD`, `TG_OP`, `TG_NAME`, `TG_WHEN`, `TG_LEVEL`, `TG_TABLE_NAME`, `TG_NARGS`, and 0-based `TG_ARGV[0]`.
 10. **Section 10 (`lines 855–996`): Inline `DO` Blocks, Interop, Security, Fallback Expressions, Subtransaction Unwinding, and SQL Identifier Disambiguation**:
     - Inline `DO $$ ... $$ LANGUAGE plpgsql_v8` (`10`), recursion & cross-language interop (`10a`, `10b`), security & `REVOKE` permissions (`10c`), SQL fallback expressions & operators (`10d`), `RETURN`/`EXIT` inside `BEGIN ... EXCEPTION` committing subtransaction writes (`10e`), nested `EXCEPTION` blocks restoring outer `SQLSTATE`/`SQLERRM` (`10f`), and column-name vs variable-name disambiguation in `INSERT ... ON CONFLICT DO UPDATE` and `UPDATE ... SET` (`10g`).
+11. **Section 11 (`lines 998–1242`): Outer-Plan `RETURN QUERY` Inlining (`prosupport`), Direct SPI-to-Tuplestore Streaming (`plan.return_query`), Statement Plan Caching (`rt._planCache`), and Exact `NUMERIC` Precision**:
+    - Single `RETURN QUERY` outer-plan inlining (`RETURNS TABLE`) verified via `EXPLAIN (COSTS OFF)` (`11a`), `LATERAL` join correlation (`11b`), multiple sequential `RETURN QUERY` (`UNION ALL`) inlining (`11c`), `IF`/`ELSIF`/`ELSE` and `CASE` compile-time constant folding and runtime `One-Time Filter` guards (`11d`, `11e`), `RETURNS SETOF` composite, scalar (`int`), and `record` (`AS (...)`) inlining (`11f`), `plpgsql_v8.inline_volatile_srf` GUC toggle (`11g`), non-inlined mixed `RETURN QUERY` + `RETURN NEXT` via `plan.return_query` (`11h`), strict `42804` column count/type mismatch verification (`11i`), statement-level SPI plan caching across `DROP TABLE`/`CREATE TABLE` DDL invalidation (`11j`), and exact arbitrary-precision `NUMERIC` (38+ digits) arithmetic (`+`, `-`, `*`, comparisons, `numeric(p,s)` rounding) without IEEE-754 precision loss (`11k`).

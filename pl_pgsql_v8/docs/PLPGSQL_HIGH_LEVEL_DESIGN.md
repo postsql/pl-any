@@ -111,16 +111,16 @@ sequenceDiagram
 ### 4.1 Chained Language Handler (`plv8_transpile_src`) & Cache Invalidation
 `plpgsql_v8` is registered in `pg_language` with `HANDLER plv8_plpgsql_handler`, `INLINE plv8_inline_handler`, and `VALIDATOR plv8_call_validator`.
 - `plv8_plpgsql_handler` is itself a `LANGUAGE plv8` function returning `language_handler`.
-- When compiling any `plpgsql_v8` function or `DO` block, `plv8_transpile_src()` ([plv8.cc:1983-2182](file:///google/src/cloud/hannuk/port_plv8_to_pljs/google3/third_party/pgext/plv8/plv8.cc#L1983-L2182)) walks the `pg_language -> lanplcallfoid` chain to `plv8`, records each handler's `(fn_oid, xmin, tid)` in `cache->handlers[]`, and calls `plv8_plpgsql_handler(prosrc, meta)`.
+- When compiling any `plpgsql_v8` function or `DO` block, `plv8_transpile_src()` (`plv8.cc:1983-2182`) walks the `pg_language -> lanplcallfoid` chain to `plv8`, records each handler's `(fn_oid, xmin, tid)` in `cache->handlers[]`, and calls `plv8_plpgsql_handler(prosrc, meta)`.
 - If `plv8_plpgsql_handler` is ever replaced (`CREATE OR REPLACE FUNCTION`), `plv8_call_validator` and `plv8_cache_handlers_valid()` automatically evict all downstream compiled functions from `ProcCacheHash`.
 
 ### 4.2 Hybrid Expression Compilation (Pure-JS Fast Path + SPI Fallback)
 Rather than evaluating every PL/pgSQL expression via SPI (`SELECT <expr>`) or failing on complex SQL expressions:
-- `compileExpr` ([plv8.sql.common:1971-2499](file:///google/src/cloud/hannuk/port_plv8_to_pljs/google3/third_party/pgext/plv8/plv8.sql.common#L1971-L2499)) uses a recursive-descent parser to compile arithmetic, 64-bit `BigInt`-aware math, static integer vs float division (`isIntType`), 3-valued boolean logic (`AND`/`OR`/`NOT`), comparisons (`IS DISTINCT FROM`, `BETWEEN`, `IN`, `LIKE`/`ILIKE`), 1-based array indexing/slicing, composite field access, `CASE` expressions, `COALESCE`/`NULLIF`/`GREATEST`/`LEAST`, and 21 common scalar/array built-ins (`callBuiltin`) directly into JavaScript calls on `globalThis.__plpgsql_v8_rt`.
+- `compileExpr` (`plv8.sql.common:1971-2499`) uses a recursive-descent parser to compile arithmetic, 64-bit `BigInt`-aware math, static integer vs float division (`isIntType`), 3-valued boolean logic (`AND`/`OR`/`NOT`), comparisons (`IS DISTINCT FROM`, `BETWEEN`, `IN`, `LIKE`/`ILIKE`), 1-based array indexing/slicing, composite field access, `CASE` expressions, `COALESCE`/`NULLIF`/`GREATEST`/`LEAST`, and 21 common scalar/array built-ins (`callBuiltin`) directly into JavaScript calls on `globalThis.__plpgsql_v8_rt`.
 - Whenever an expression contains SQL-only keywords (`SQL_ONLY_KEYWORDS`) or unknown SQL catalog functions, `compileExpr` catches `new Error('fallback')`, rewrites all referenced PL/pgSQL variables into `$1, $2, ...` via `rewriteSqlTokensWithParams`, and emits `__rt.evalSql("SELECT (...) AS __val", [...])`.
 
 ### 4.3 Context-Aware SQL Token Rewriting
-In PL/pgSQL, function parameters and local variables often share names with table columns. `rewriteSqlTokensWithParams` ([plv8.sql.common:1738-1969](file:///google/src/cloud/hannuk/port_plv8_to_pljs/google3/third_party/pgext/plv8/plv8.sql.common#L1738-L1969)) tracks SQL syntactic state across `INSERT INTO tbl (cols)`, `ON CONFLICT (cols)`, `UPDATE tbl SET col = ...`, `SET (col1, col2) = ...`, `WITH cte (cols) AS (...)`, and table references after `FROM`/`JOIN`/`UPDATE`/`INTO` so target column identifiers are never mistakenly replaced by `$N` parameter placeholders.
+In PL/pgSQL, function parameters and local variables often share names with table columns. `rewriteSqlTokensWithParams` (`plv8.sql.common:1738-1969`) tracks SQL syntactic state across `INSERT INTO tbl (cols)`, `ON CONFLICT (cols)`, `UPDATE tbl SET col = ...`, `SET (col1, col2) = ...`, `WITH cte (cols) AS (...)`, and table references after `FROM`/`JOIN`/`UPDATE`/`INTO` so target column identifiers are never mistakenly replaced by `$N` parameter placeholders.
 
 ### 4.4 Subtransaction-Safe Control Unwinding (`__ctrl`)
 `BEGIN ... EXCEPTION WHEN ... END` blocks execute their body inside `plv8.subtransaction(function() { ... })`. If the body executes `RETURN`, `EXIT`, or `CONTINUE` that jumps out of the subtransaction callback, throwing a JS exception would cause `plv8_Subtransaction` to abort and roll back the subtransaction's valid SQL changes. Instead, `plpgsql_v8` records a control descriptor `__ctrl = { type: "return", value: ... }` or `{ type: "exit" | "continue", jsLabel: ... }` and returns normally from the callback—committing the subtransaction cleanly—and then unwinds the control transfer immediately outside the `plv8.subtransaction()` call via `emitCtrlUnwindCheck()`.
@@ -129,6 +129,6 @@ In PL/pgSQL, function parameters and local variables often share names with tabl
 
 ## 5. Related Documentation
 
-- **Detailed Design & Architecture**: [PLPGSQL_V8_DESIGN.md](file:///google/src/cloud/hannuk/port_plv8_to_pljs/google3/third_party/pgext/plv8/docs/PLPGSQL_V8_DESIGN.md)
-- **Implementation Walk-Through**: [PLPGSQL_IMPLEMENTATION_WALKTHROUGH.md](file:///google/src/cloud/hannuk/port_plv8_to_pljs/google3/third_party/pgext/plv8/docs/PLPGSQL_IMPLEMENTATION_WALKTHROUGH.md)
-- **User Guide & Language Reference**: [PLPGSQL_V8.md](file:///google/src/cloud/hannuk/port_plv8_to_pljs/google3/third_party/pgext/plv8/docs/PLPGSQL_V8.md)
+- **Detailed Design & Architecture**: [PLPGSQL_V8_DESIGN.md](PLPGSQL_V8_DESIGN.md)
+- **Implementation Walk-Through**: [PLPGSQL_IMPLEMENTATION_WALKTHROUGH.md](PLPGSQL_IMPLEMENTATION_WALKTHROUGH.md)
+- **User Guide & Language Reference**: [PLPGSQL_V8.md](PLPGSQL_V8.md)

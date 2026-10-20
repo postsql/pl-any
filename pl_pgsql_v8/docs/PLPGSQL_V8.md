@@ -1,8 +1,8 @@
-# `plpgsql_v8` User Guide: PL/pgSQL on the V8 JavaScript Engine
+# `plpgsql_v8` User Guide: PL/pgSQL on the V8 & QuickJS JavaScript Engines
 
-`plpgsql_v8` is a PostgreSQL procedural language bundled with the `plv8` extension that compiles standard **PL/pgSQL** functions, procedures, triggers, and `DO` blocks into native **V8 JavaScript**.
+`plpgsql_v8` is a PostgreSQL procedural language extension (`pl_pgsql_v8`) that compiles standard **PL/pgSQL** functions, procedures, triggers, and `DO` blocks into native **JavaScript** running on either **V8** (`plv8`) or **QuickJS** (`pljs`).
 
-By compiling PL/pgSQL control flow (`IF`, `CASE`, `LOOP`, `WHILE`, `FOR`, `FOREACH`), variable assignments, array indexing, composite field manipulation, and scalar expressions directly to V8 bytecode/machine code, `plpgsql_v8` eliminates PostgreSQL Server Programming Interface (SPI) overhead on procedural and compute-heavy workloads while preserving full access to PostgreSQL SQL, subtransactions (`EXCEPTION` blocks), cursors, and triggers.
+By compiling PL/pgSQL control flow (`IF`, `CASE`, `LOOP`, `WHILE`, `FOR`, `FOREACH`), variable assignments, array indexing, composite field manipulation, and scalar expressions directly to JavaScript bytecode/machine code—and by inlining eligible `RETURN QUERY` set-returning functions directly into the caller's outer PostgreSQL query plan via `SupportRequestSimplify` (`prosupport`)—`plpgsql_v8` eliminates PostgreSQL Server Programming Interface (SPI) overhead on procedural and compute-heavy workloads while preserving full access to PostgreSQL SQL, subtransactions (`EXCEPTION` blocks), cursors, and triggers.
 
 ---
 
@@ -16,7 +16,7 @@ By compiling PL/pgSQL control flow (`IF`, `CASE`, `LOOP`, `WHILE`, `FOR`, `FOREA
    - [2.4 Copying Types (`%TYPE`) and Row Types (`%ROWTYPE`, `RECORD`)](#24-copying-types-type-and-row-types-rowtype-record)
 3. [Expressions, Operators & Fast-Path Built-ins](#3-expressions-operators--fast-path-built-ins)
    - [3.1 Three-Valued Boolean Logic (`AND`, `OR`, `NOT`, `IS`)](#31-three-valued-boolean-logic-and-or-not-is)
-   - [3.2 64-Bit `bigint` Arithmetic & Integer vs Float Division](#32-64-bit-bigint-arithmetic--integer-vs-float-division)
+   - [3.2 64-Bit `bigint` & Exact Arbitrary-Precision `numeric` Arithmetic](#32-64-bit-bigint--exact-arbitrary-precision-numeric-arithmetic)
    - [3.3 1-Based Array Indexing & Slicing](#33-1-based-array-indexing--slicing)
    - [3.4 Fast-Path SQL Built-ins vs Automatic SQL Fallback](#34-fast-path-sql-built-ins-vs-automatic-sql-fallback)
 4. [Control Flow Statements](#4-control-flow-statements)
@@ -25,11 +25,12 @@ By compiling PL/pgSQL control flow (`IF`, `CASE`, `LOOP`, `WHILE`, `FOR`, `FOREA
    - [4.3 Integer `FOR` Loops](#43-integer-for-loops)
    - [4.4 Query `FOR` Loops (Static and Dynamic)](#44-query-for-loops-static-and-dynamic)
    - [4.5 Array `FOREACH` Loops (Including `SLICE`)](#45-array-foreach-loops-including-slice)
-5. [Executing SQL Commands](#5-executing-sql-commands)
+5. [Executing SQL Commands & Statement Plan Caching](#5-executing-sql-commands--statement-plan-caching)
    - [5.1 `SELECT ... INTO [STRICT]` and `FOUND`](#51-select--into-strict-and-found)
    - [5.2 `PERFORM`](#52-perform)
    - [5.3 Static DML (`INSERT`, `UPDATE`, `DELETE`) & Column Disambiguation](#53-static-dml-insert-update-delete--column-disambiguation)
    - [5.4 Dynamic SQL (`EXECUTE ... INTO [STRICT] ... USING`)](#54-dynamic-sql-execute--into-strict--using)
+   - [5.5 Automatic SPI Statement Plan Caching (`rt._planCache`)](#55-automatic-spi-statement-plan-caching-rt_plancache)
 6. [Error Trapping, `RAISE`, `ASSERT` & Diagnostics](#6-error-trapping-raise-assert--diagnostics)
    - [6.1 `BEGIN ... EXCEPTION WHEN ... END`](#61-begin--exception-when--end)
    - [6.2 `RAISE` and Re-Raising (`RAISE;`)](#62-raise-and-re-raising-raise)
@@ -42,7 +43,9 @@ By compiling PL/pgSQL control flow (`IF`, `CASE`, `LOOP`, `WHILE`, `FOR`, `FOREA
 8. [Functions, Set-Returning Functions & Stored Procedures](#8-functions-set-returning-functions--stored-procedures)
    - [8.1 `OUT` and `INOUT` Parameters](#81-out-and-inout-parameters)
    - [8.2 Set-Returning Functions (`RETURN NEXT`, `RETURN QUERY`, `RETURNS TABLE`)](#82-set-returning-functions-return-next-return-query-returns-table)
-   - [8.3 Stored Procedures (`CREATE PROCEDURE`, `CALL`, `COMMIT`, `ROLLBACK`)](#83-stored-procedures-create-procedure-call-commit-rollback)
+   - [8.3 Planner-Level Outer-Plan `RETURN QUERY` Inlining (`prosupport`)](#83-planner-level-outer-plan-return-query-inlining-prosupport)
+   - [8.4 Direct C/C++ SPI-to-Tuplestore Streaming (`plan.return_query`)](#84-direct-cc-spi-to-tuplestore-streaming-planreturn_query)
+   - [8.5 Stored Procedures (`CREATE PROCEDURE`, `CALL`, `COMMIT`, `ROLLBACK`)](#85-stored-procedures-create-procedure-call-commit-rollback)
 9. [Trigger Functions & Inline `DO` Blocks](#9-trigger-functions--inline-do-blocks)
    - [9.1 Row and Statement Triggers (`NEW`, `OLD`, `TG_*`, `TG_ARGV`)](#91-row-and-statement-triggers-new-old-tg_-tg_argv)
    - [9.2 Anonymous `DO` Blocks](#92-anonymous-do-blocks)
@@ -53,10 +56,16 @@ By compiling PL/pgSQL control flow (`IF`, `CASE`, `LOOP`, `WHILE`, `FOR`, `FOREA
 
 ## 1. Getting Started
 
-`plpgsql_v8` is automatically installed when you create the `plv8` extension:
+`plpgsql_v8` runs on top of either `plv8` (V8 engine) or `pljs` (QuickJS engine):
 
 ```sql
-CREATE EXTENSION plv8;
+-- Using V8 (plv8):
+CREATE EXTENSION IF NOT EXISTS plv8;
+CREATE EXTENSION pl_pgsql_v8;
+
+-- Or using QuickJS (pljs):
+CREATE EXTENSION IF NOT EXISTS pljs;
+CREATE EXTENSION pl_pgsql_v8;
 ```
 
 To write a function in `plpgsql_v8`, use standard PL/pgSQL syntax and specify `LANGUAGE plpgsql_v8`:
@@ -201,9 +210,10 @@ Unlike raw JavaScript, `plpgsql_v8` implements strict SQL three-valued logic (`T
 - `NOT NULL` evaluates to `NULL`
 - `IS [NOT] NULL`, `IS [NOT] TRUE`, `IS [NOT] FALSE`, `IS [NOT] UNKNOWN`, and `IS [NOT] DISTINCT FROM` behave identically to PostgreSQL SQL.
 
-### 3.2 64-Bit `bigint` Arithmetic & Integer vs Float Division
+### 3.2 64-Bit `bigint` & Exact Arbitrary-Precision `numeric` Arithmetic
 
-- **64-bit `bigint` (`int8`)**: Values above JavaScript's `Number.MAX_SAFE_INTEGER` ($2^{53} - 1 = 9,007,199,254,740,991$) are automatically promoted to V8 `BigInt` so 64-bit integer arithmetic never loses precision.
+- **64-bit `bigint` (`int8`)**: Values above JavaScript's `Number.MAX_SAFE_INTEGER` ($2^{53} - 1 = 9,007,199,254,740,991$) are automatically promoted to JavaScript `BigInt` so 64-bit integer arithmetic never loses precision.
+- **Exact Arbitrary-Precision `numeric` (`decimal`)**: `plpgsql_v8` enables `meta.preserve_numeric_precision = true` on `plv8` / `pljs`. Any `NUMERIC` value with more than 15 significant digits (or outside safe IEEE-754 `double` bounds) is marshaled between PostgreSQL and JavaScript as its exact decimal string representation, and `__plpgsql_v8_rt`'s arithmetic and comparison helpers (`add`, `sub`, `mul`, `cmpVal`, `uminus`, `coerce`) perform exact `BigInt`-scaled decimal arithmetic with zero precision loss across 38+ decimal digits.
 - **Integer vs Float Division (`/`)**: When both operands of `/` are integer-typed (`smallint`, `integer`, `bigint`, or integer literals), `/` performs truncating integer division (`10 / 3 = 3`), matching SQL/PL/pgSQL. When either operand is floating-point or `numeric` (`10.0 / 3`), `/` performs floating-point division. Dividing by zero raises SQLSTATE `22012` (`division_by_zero`).
 
 ### 3.3 1-Based Array Indexing & Slicing
@@ -337,7 +347,7 @@ END;
 
 ---
 
-## 5. Executing SQL Commands
+## 5. Executing SQL Commands & Statement Plan Caching
 
 ### 5.1 `SELECT ... INTO [STRICT]` and `FOUND`
 
@@ -396,6 +406,13 @@ EXECUTE 'UPDATE ' || quote_ident(tbl_name) || ' SET salary = salary + $1 WHERE i
   INTO STRICT v_new_salary
   USING p_raise, p_id;
 ```
+
+### 5.5 Automatic SPI Statement Plan Caching (`rt._planCache`)
+
+All static `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `PERFORM`, `FOR ... IN SELECT`, `RETURN QUERY`, and fallback `evalSql` statements are automatically prepared and cached in `__plpgsql_v8_rt._planCache` via `plv8.prepare(sql)` / `pljs.prepare(sql)` and re-executed with `plan.execute(params)` or `plan.return_query(params, strict)`:
+- **Zero Re-Planning Overhead**: Repeated calls to a `plpgsql_v8` function (or repeated iterations inside a loop) reuse the saved PostgreSQL `SPIPlanPtr`.
+- **Automatic Cache Invalidation**: `rt._planCache` tracks `pg.proc_cache_key('*')` (`pg_proc` catalog invalidation counter) and automatically frees and clears cached plans whenever catalog changes occur or if a statement encounters a `cached plan must not change result type` (`0A000`) error after DDL such as `DROP TABLE` / `CREATE TABLE` or `ALTER TABLE`.
+- **DDL Bypass**: Non-preparable utility/DDL statements (`CREATE`, `DROP`, `ALTER`, `TRUNCATE`, `SET`, `VACUUM`, etc.) automatically bypass `prepare()` and execute directly via `pg.execute()`.
 
 ---
 
@@ -588,9 +605,33 @@ END;
 $$ LANGUAGE plpgsql_v8;
 ```
 
-Dynamic set-returning queries are also supported via `RETURN QUERY EXECUTE sql_string [USING arg1, ...]`. Both `RETURN QUERY` and `RETURN QUERY EXECUTE` stream rows directly from PostgreSQL SPI into the function's output tuplestore in C++ via `plv8.return_query(sql, params)` (bypassing V8 JavaScript row materialization) and update `FOUND` and `GET DIAGNOSTICS ... = ROW_COUNT`.
+Dynamic set-returning queries are also supported via `RETURN QUERY EXECUTE sql_string [USING arg1, ...]`.
 
-### 8.3 Stored Procedures (`CREATE PROCEDURE`, `CALL`, `COMMIT`, `ROLLBACK`)
+### 8.3 Planner-Level Outer-Plan `RETURN QUERY` Inlining (`prosupport`)
+
+When a set-returning `plpgsql_v8` function consists purely of `RETURN QUERY` statements (or conditional `IF ... ELSIF ... ELSE` / `CASE` branches containing `RETURN QUERY` and/or empty `RETURN;`), `plpgsql_v8` automatically registers `plv8_call_support` (`plv8`) or `pljs_call_support` (`pljs`) as the function's `pg_proc.prosupport` planner hook (`meta.support_func`).
+
+When PostgreSQL plans an outer query that calls the function in a `FROM` clause (`FuncExpr` or `RangeTblFunction`), `SupportRequestSimplify` / `SupportRequestInlineInFrom` replaces the `FunctionScan` node with the underlying SQL query AST directly in the outer execution plan:
+- **Zero JS & Zero SPI Execution Overhead**: The inlined query participates directly in outer-query join reordering, index scans, predicate pushdown, `LIMIT` early termination, and parallel query execution.
+- **Supported `RETURN QUERY` Shapes**:
+  - Single `RETURN QUERY SELECT ...` or `RETURN QUERY WITH ... SELECT ...`
+  - Multiple sequential `RETURN QUERY` statements (combined via `UNION ALL`)
+  - `IF ... THEN ... ELSIF ... THEN ... ELSE ... END IF` and `CASE ... WHEN ... END CASE` branches containing `RETURN QUERY` and/or `RETURN;`:
+    - When all arguments in a branch condition are compile-time constants (`Const`), the planner folds the condition at plan time and emits **only** the matching branch's query without `Result` / `One-Time Filter` wrappers.
+    - When conditions depend on runtime parameters or `LATERAL` columns, each branch is guarded by a `WHERE (<cond>)` `One-Time Filter` inside a `UNION ALL` (or `WHERE` clause for single-branch `IF`).
+  - All return types: `RETURNS TABLE(...)`, `RETURNS SETOF <composite_type>`, `RETURNS SETOF <scalar_type>`, and `RETURNS SETOF record` (with caller `AS (col1 type1, ...)` column definition lists).
+- **Controlling Volatile SRF Inlining (`plpgsql_v8.inline_volatile_srf`)**:
+  - By default (`plpgsql_v8.inline_volatile_srf = 'on'`), both `VOLATILE` (PostgreSQL's default volatility when `IMMUTABLE`/`STABLE` is omitted) and `STABLE`/`IMMUTABLE` `RETURN QUERY` SRFs are inlined.
+  - Set `SET plpgsql_v8.inline_volatile_srf = 'off';` to restrict planner inlining to functions explicitly declared `STABLE` or `IMMUTABLE` (read via the zero-SPI C++ fast path `pg.current_setting('plpgsql_v8.inline_volatile_srf', true)`).
+
+### 8.4 Direct C/C++ SPI-to-Tuplestore Streaming (`plan.return_query`)
+
+When a set-returning `plpgsql_v8` function is not inlined into the outer plan (for example, when it mixes `RETURN QUERY` with procedural loops, local variable mutations, `RETURN NEXT`, or `RETURN QUERY EXECUTE`), `RETURN QUERY` and `RETURN QUERY EXECUTE` execute entirely in C/C++ via `plan.return_query(params, true)` and `plv8.return_query(sql, params, true)`:
+- **Zero JS Row Materialization**: Rows returned by `SPI_execute_plan` / `SPI_execute` are written directly from `SPI_tuptable` into the SRF's `ReturnSetInfo` `Tuplestorestate` (`tupstore`) in C/C++ without creating JavaScript objects or V8/QuickJS values per row, returning only the integer row count (`SPI_processed`) to JavaScript to update `FOUND` and `ROW_COUNT`.
+- **Whole-Tuple Fast Path**: When the query's `SPI_tuptable->tupdesc` column types match the function's output `tupdesc`, tuples are copied directly via `tuplestore_puttuple` without per-column `heap_getattr` / `tuplestore_putvalues` overhead.
+- **Strict PL/pgSQL Column Structure Verification (`42804`)**: Passing `strict = true` enforces native PL/pgSQL `ERRCODE_DATATYPE_MISMATCH` (`42804`: `"structure of query does not match function result type"`) whenever the number of result columns or any column's type OID differs from the declared SRF output descriptor (while allowing binary-coercible types via `IsBinaryCoercible`).
+
+### 8.5 Stored Procedures (`CREATE PROCEDURE`, `CALL`, `COMMIT`, `ROLLBACK`)
 
 Stored procedures created with `CREATE PROCEDURE ... LANGUAGE plpgsql_v8` can use `INOUT` / `OUT` parameters and transaction control statements (`COMMIT` and `ROLLBACK`):
 

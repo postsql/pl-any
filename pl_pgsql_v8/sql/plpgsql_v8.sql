@@ -1,6 +1,3 @@
-CREATE EXTENSION IF NOT EXISTS plv8;
-CREATE EXTENSION IF NOT EXISTS pl_pgsql_v8;
-
 -- ============================================================================
 -- 1. Verify C++ fixes:
 --    (a) Cursor subtransaction handling (SPI stays connected after cursor error)
@@ -979,6 +976,310 @@ $$ LANGUAGE plpgsql_v8;
 
 SELECT jsonb_pretty(test_cursor_prior_and_for_found());
 DROP FUNCTION test_cursor_prior_and_for_found();
+
+-- ============================================================================
+-- 11. Outer-Plan RETURN QUERY Inlining, Direct SPI-to-Tuplestore Streaming,
+--     Statement Plan Caching & Exact NUMERIC Precision
+-- ============================================================================
+
+CREATE TABLE rq_orders (
+  order_id int PRIMARY KEY,
+  customer_id int NOT NULL,
+  status text NOT NULL,
+  amount numeric(38, 18) NOT NULL
+);
+
+INSERT INTO rq_orders VALUES
+  (1, 10, 'PAID', 100.123456789012345678),
+  (2, 10, 'PENDING', 50.000000000000000001),
+  (3, 20, 'PAID', 250.987654321098765432),
+  (4, 30, 'CANCELLED', 10.000000000000000000);
+
+-- 11a. Single RETURN QUERY with RETURNS TABLE and named/positional parameters
+CREATE FUNCTION rq_orders_by_customer(p_cust int, p_status text)
+RETURNS TABLE(order_id int, amount numeric(38, 18)) AS $$
+BEGIN
+  RETURN QUERY
+    SELECT o.order_id, o.amount
+    FROM rq_orders o
+    WHERE o.customer_id = p_cust AND o.status = $2
+    ORDER BY o.order_id;
+END;
+$$ LANGUAGE plpgsql_v8 STABLE;
+
+-- Verify prosupport was attached automatically at CREATE FUNCTION time
+SELECT p.proname, (p.prosupport <> 0) AS has_prosupport
+FROM pg_proc p
+WHERE p.oid = 'rq_orders_by_customer(int, text)'::regprocedure;
+
+-- EXPLAIN (COSTS OFF) proves Function Scan is eliminated and replaced by direct table scan
+EXPLAIN (COSTS OFF)
+SELECT * FROM rq_orders_by_customer(10, 'PAID');
+
+SELECT * FROM rq_orders_by_customer(10, 'PAID');
+
+-- 11b. LATERAL join with outer Var correlation ($1 correlated from outer query)
+EXPLAIN (COSTS OFF)
+SELECT c.cid, r.order_id, r.amount
+FROM (VALUES (10), (20)) AS c(cid)
+CROSS JOIN LATERAL rq_orders_by_customer(c.cid, 'PAID') r
+ORDER BY c.cid, r.order_id;
+
+SELECT c.cid, r.order_id, r.amount
+FROM (VALUES (10), (20)) AS c(cid)
+CROSS JOIN LATERAL rq_orders_by_customer(c.cid, 'PAID') r
+ORDER BY c.cid, r.order_id;
+
+-- 11c. Multiple sequential RETURN QUERY statements (compiled to UNION ALL)
+CREATE FUNCTION rq_multi_status(p_cust int)
+RETURNS TABLE(order_id int, status text) AS $$
+BEGIN
+  RETURN QUERY SELECT o.order_id, o.status FROM rq_orders o WHERE o.customer_id = p_cust AND o.status = 'PAID';
+  RETURN QUERY SELECT o.order_id, o.status FROM rq_orders o WHERE o.customer_id = p_cust AND o.status = 'PENDING';
+  RETURN;
+END;
+$$ LANGUAGE plpgsql_v8 STABLE;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM rq_multi_status(10) ORDER BY order_id;
+
+SELECT * FROM rq_multi_status(10) ORDER BY order_id;
+
+-- 11d. Conditional IF / ELSIF / ELSE RETURN QUERY with constant folding (Const arg)
+-- and runtime WHERE guards (non-Const / LATERAL arg)
+CREATE FUNCTION rq_conditional_orders(p_mode int, p_cust int)
+RETURNS TABLE(order_id int, status text) AS $$
+DECLARE
+  c_paid CONSTANT text := 'PAID';
+  c_pending CONSTANT text := 'PENDING';
+BEGIN
+  IF p_mode = 1 THEN
+    RETURN QUERY SELECT o.order_id, o.status FROM rq_orders o WHERE o.customer_id = p_cust AND o.status = c_paid;
+  ELSIF p_mode = 2 THEN
+    RETURN QUERY SELECT o.order_id, o.status FROM rq_orders o WHERE o.customer_id = p_cust AND o.status = c_pending;
+  ELSE
+    RETURN QUERY SELECT o.order_id, o.status FROM rq_orders o WHERE o.customer_id = p_cust;
+  END IF;
+END;
+$$ LANGUAGE plpgsql_v8 STABLE;
+
+-- Constant p_mode = 1 folds away ELSIF and ELSE branches at plan time!
+EXPLAIN (COSTS OFF)
+SELECT * FROM rq_conditional_orders(1, 10) ORDER BY order_id;
+
+SELECT * FROM rq_conditional_orders(1, 10) ORDER BY order_id;
+SELECT * FROM rq_conditional_orders(2, 10) ORDER BY order_id;
+SELECT * FROM rq_conditional_orders(99, 10) ORDER BY order_id;
+
+-- Non-constant p_mode in LATERAL join uses UNION ALL with runtime branch guards
+EXPLAIN (COSTS OFF)
+SELECT m.mode, r.order_id, r.status
+FROM (VALUES (1), (2)) AS m(mode)
+CROSS JOIN LATERAL rq_conditional_orders(m.mode, 10) r
+ORDER BY m.mode, r.order_id;
+
+SELECT m.mode, r.order_id, r.status
+FROM (VALUES (1), (2)) AS m(mode)
+CROSS JOIN LATERAL rq_conditional_orders(m.mode, 10) r
+ORDER BY m.mode, r.order_id;
+
+-- 11e. CASE statement RETURN QUERY inlining
+CREATE FUNCTION rq_case_orders(p_kind text)
+RETURNS TABLE(order_id int, customer_id int) AS $$
+BEGIN
+  CASE p_kind
+    WHEN 'paid' THEN
+      RETURN QUERY SELECT o.order_id, o.customer_id FROM rq_orders o WHERE o.status = 'PAID';
+    WHEN 'cancelled' THEN
+      RETURN QUERY SELECT o.order_id, o.customer_id FROM rq_orders o WHERE o.status = 'CANCELLED';
+    ELSE
+      RETURN QUERY SELECT o.order_id, o.customer_id FROM rq_orders o WHERE o.status = 'PENDING';
+  END CASE;
+END;
+$$ LANGUAGE plpgsql_v8 STABLE;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM rq_case_orders('paid') ORDER BY order_id;
+
+SELECT * FROM rq_case_orders('paid') ORDER BY order_id;
+SELECT * FROM rq_case_orders('other') ORDER BY order_id;
+
+-- 11f. RETURNS SETOF composite, RETURNS SETOF scalar, and RETURNS SETOF record
+CREATE FUNCTION rq_setof_composite(p_cust int)
+RETURNS SETOF rq_orders AS $$
+BEGIN
+  RETURN QUERY SELECT * FROM rq_orders WHERE customer_id = p_cust ORDER BY order_id;
+END;
+$$ LANGUAGE plpgsql_v8 STABLE;
+
+EXPLAIN (COSTS OFF)
+SELECT order_id, status FROM rq_setof_composite(10);
+
+SELECT order_id, status FROM rq_setof_composite(10);
+
+CREATE FUNCTION rq_setof_scalar(p_status text)
+RETURNS SETOF int AS $$
+BEGIN
+  RETURN QUERY SELECT order_id FROM rq_orders WHERE status = p_status ORDER BY order_id;
+END;
+$$ LANGUAGE plpgsql_v8 STABLE;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM rq_setof_scalar('PAID');
+
+SELECT * FROM rq_setof_scalar('PAID');
+
+CREATE FUNCTION rq_setof_record(p_cust int)
+RETURNS SETOF record AS $$
+BEGIN
+  RETURN QUERY SELECT order_id, status FROM rq_orders WHERE customer_id = p_cust ORDER BY order_id;
+END;
+$$ LANGUAGE plpgsql_v8 STABLE;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM rq_setof_record(10) AS t(order_id int, status text);
+
+SELECT * FROM rq_setof_record(10) AS t(order_id int, status text);
+
+-- 11g. VOLATILE SRF inlining and plpgsql_v8.inline_volatile_srf GUC toggle
+CREATE FUNCTION rq_volatile_orders(p_cust int)
+RETURNS TABLE(order_id int, status text) AS $$
+BEGIN
+  RETURN QUERY SELECT o.order_id, o.status FROM rq_orders o WHERE o.customer_id = p_cust ORDER BY o.order_id;
+END;
+$$ LANGUAGE plpgsql_v8 VOLATILE;
+
+-- Default: plpgsql_v8.inline_volatile_srf is 'on', so VOLATILE RETURN QUERY SRF is inlined
+EXPLAIN (COSTS OFF)
+SELECT * FROM rq_volatile_orders(10);
+
+SELECT * FROM rq_volatile_orders(10);
+
+-- When plpgsql_v8.inline_volatile_srf = 'off', planner keeps Function Scan and
+-- runtime executes direct SPI-to-tuplestore streaming via plan.return_query()
+SET plpgsql_v8.inline_volatile_srf = 'off';
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM rq_volatile_orders(10);
+
+SELECT * FROM rq_volatile_orders(10);
+
+RESET plpgsql_v8.inline_volatile_srf;
+
+-- 11h. Non-inlinable SRF (mixed RETURN NEXT + RETURN QUERY) uses direct SPI-to-tuplestore
+-- streaming and enforces strict PL/pgSQL column structure check (42804)
+CREATE FUNCTION rq_mixed_streaming(p_cust int)
+RETURNS TABLE(order_id int, status text) AS $$
+BEGIN
+  order_id := 0;
+  status := 'HEADER';
+  RETURN NEXT;
+  RETURN QUERY SELECT o.order_id, o.status FROM rq_orders o WHERE o.customer_id = p_cust ORDER BY o.order_id;
+END;
+$$ LANGUAGE plpgsql_v8;
+
+SELECT * FROM rq_mixed_streaming(10);
+
+CREATE FUNCTION rq_bad_colcount()
+RETURNS TABLE(order_id int, status text) AS $$
+BEGIN
+  IF true THEN
+    order_id := 1;
+    status := 'OK';
+    -- force non-inlined execution by mixing assignment + RETURN QUERY
+  END IF;
+  RETURN QUERY SELECT o.order_id FROM rq_orders o;
+END;
+$$ LANGUAGE plpgsql_v8;
+
+\set VERBOSITY terse
+SELECT * FROM rq_bad_colcount();
+\set VERBOSITY default
+
+-- 11i. Direct plv8.return_query() and plan.return_query() API in JS
+CREATE FUNCTION test_js_return_query_api(p_cust int)
+RETURNS TABLE(order_id int, status text) AS $$
+  plv8.return_query("SELECT order_id, status FROM rq_orders WHERE customer_id = $1 ORDER BY order_id", [p_cust], true);
+  var plan = plv8.prepare("SELECT order_id + 100 AS order_id, status FROM rq_orders WHERE customer_id = $1 ORDER BY order_id", ["int4"]);
+  try {
+    plan.return_query([p_cust], true);
+  } finally {
+    plan.free();
+  }
+$$ LANGUAGE plv8;
+
+SELECT * FROM test_js_return_query_api(10);
+DROP FUNCTION test_js_return_query_api(int);
+
+-- 11j. Statement-level SPI plan caching across repeated calls and DDL invalidation
+CREATE TABLE rq_cache_tab (id int, val int);
+INSERT INTO rq_cache_tab VALUES (1, 100), (2, 200);
+
+CREATE FUNCTION test_stmt_plan_cache(p_id int) RETURNS int AS $$
+DECLARE
+  v_res int;
+BEGIN
+  SELECT val INTO v_res FROM rq_cache_tab WHERE id = p_id;
+  RETURN v_res;
+END;
+$$ LANGUAGE plpgsql_v8;
+
+SELECT test_stmt_plan_cache(1), test_stmt_plan_cache(2), test_stmt_plan_cache(1);
+
+-- DDL invalidates catalog_gen and refreshes cached plans cleanly
+ALTER TABLE rq_cache_tab ADD COLUMN extra text DEFAULT 'ok';
+SELECT test_stmt_plan_cache(1), test_stmt_plan_cache(2);
+
+DROP FUNCTION test_stmt_plan_cache(int);
+DROP TABLE rq_cache_tab;
+
+-- 11k. Exact NUMERIC precision (>15 significant digits, 38-digit decimal arithmetic & comparisons)
+CREATE FUNCTION test_exact_numeric_precision(a numeric, b numeric)
+RETURNS jsonb AS $$
+DECLARE
+  v_sum numeric;
+  v_diff numeric;
+  v_prod numeric;
+  v_gt bool;
+  v_eq bool;
+  v_db_sum numeric;
+BEGIN
+  v_sum := a + b;
+  v_diff := a - b;
+  v_prod := a * 2;
+  v_gt := (v_sum > a);
+  v_eq := (v_sum - b = a);
+  SELECT o.amount + a INTO v_db_sum FROM rq_orders o WHERE o.order_id = 1;
+  RETURN jsonb_build_object(
+    'a', a::text,
+    'b', b::text,
+    'sum', v_sum::text,
+    'diff', v_diff::text,
+    'prod', v_prod::text,
+    'gt', v_gt,
+    'eq', v_eq,
+    'db_sum', v_db_sum::text
+  );
+END;
+$$ LANGUAGE plpgsql_v8;
+
+SELECT jsonb_pretty(test_exact_numeric_precision(
+  12345678901234567890.123456789012345678,
+  0.000000000000000009
+));
+
+DROP FUNCTION test_exact_numeric_precision(numeric, numeric);
+DROP FUNCTION rq_bad_colcount();
+DROP FUNCTION rq_mixed_streaming(int);
+DROP FUNCTION rq_volatile_orders(int);
+DROP FUNCTION rq_setof_record(int);
+DROP FUNCTION rq_setof_scalar(text);
+DROP FUNCTION rq_setof_composite(int);
+DROP FUNCTION rq_case_orders(text);
+DROP FUNCTION rq_conditional_orders(int, int);
+DROP FUNCTION rq_multi_status(int);
+DROP FUNCTION rq_orders_by_customer(int, text);
+DROP TABLE rq_orders;
 
 -- Cleanup
 DROP FUNCTION runtime_notnull_violation(int);
